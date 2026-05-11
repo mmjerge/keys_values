@@ -143,12 +143,16 @@ class InferenceAttnWeightsReplayCache(AttnWeightsKVCache, InferenceReplayCacheMi
         replay_log: AttnWeightsReplayLog,
         **base_kwargs,
     ):
+        if "grace_period" not in base_kwargs:
+            base_kwargs = {
+                **base_kwargs,
+                "grace_period": replay_log.grace_period,
+            }
         AttnWeightsKVCache.__init__(
             self,
             config=config,
             buffers=buffers,
             block_idx=block_idx,
-            grace_period=replay_log.grace_period,
             **base_kwargs,
         )
         InferenceReplayCacheMixin.__init__(self)
