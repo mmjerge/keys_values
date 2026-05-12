@@ -1383,7 +1383,7 @@ def fit(
                 num_devices=devices,
             )
             print_message(
-                f"Resume training: Continue from iteration {state['iter_num']}",
+                f"Resume training: Continue from epoch {train_iterator.epoch}, iteration {state['iter_num']}",
                 fabric,
             )
         if training_state is not None:

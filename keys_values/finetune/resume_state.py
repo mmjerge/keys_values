@@ -144,11 +144,15 @@ class TrainingStateManager:
             name: self.state[name].state_dict() for name in self._state_components
         }
         kwargs = dict(dtype=torch.int64)
+        iter_state = {
+            **get_iterator(self.train_iterator).state_dict(),
+            "epoch": torch.tensor(self.train_iterator.epoch, **kwargs),
+        }
         train_state.update(
             {
                 "data_state": self.dataset.training_state.state_dict(),
                 "iter_num": torch.tensor(self.state["iter_num"], **kwargs),
-                "train_iterator": get_iterator(self.train_iterator).state_dict(),
+                "train_iterator": iter_state,
             }
         )
         return train_state
@@ -245,9 +249,11 @@ def restore_from_training_state(
         elif name in train_state:
             raise ValueError(f"{name}: Contained in train_state, but not in state")
     # Reconstruct the training iterator
+    iter_state = train_state["train_iterator"]
     inner_iter = get_iterator(train_iterator)
-    inner_iter.load_state_dict(train_state["train_iterator"])
+    inner_iter.load_state_dict(iter_state)
     train_iterator._iterator = inner_iter
+    train_iterator.epoch = iter_state["epoch"].item()
 
 
 def restore_dataset_from_training_state(
