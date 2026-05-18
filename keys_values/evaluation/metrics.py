@@ -74,16 +74,29 @@ def sub_exact_similarity(a: str, b: str) -> float:
 
 
 def sub_exact_match(
-    response: str, target_value: str | int | float, *, threshold: float = 0.90
+    response: str,
+    target_value: str | int | float,
+    *,
+    threshold: Optional[float] = None,
 ) -> bool:
     """
-    Determine whether the response and target_value have substring exact match (normalized).
+    Determine whether the response and target_value have substring exact match
+    (normalized).
+
+    Args:
+        response: Sampled response
+        target_value: Target string to match in `response`
+        threshold: If given, we also allow for an approximate match with this
+            threshold.
+
+    Returns:
+        Is there a sub exact match?
+
     """
     response = normalize_string_response(response)
     target_value = str(target_value)
-    if response in target_value or target_value in response:
-        is_match = True
-    else:
+    is_match = target_value in response
+    if not is_match and threshold is not None:
         match_score = sub_exact_similarity(response, target_value)
         is_match = match_score >= threshold
     return is_match
