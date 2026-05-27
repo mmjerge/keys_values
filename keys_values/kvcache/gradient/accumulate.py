@@ -406,11 +406,14 @@ class GradientAccumulator:
         self,
         cache_lengths_of_shard: List[int],
     ) -> List[DefaultKVCacheBuffers]:
-        return select_entries(
+        result = select_entries(
             cache_lengths_of_shard=cache_lengths_of_shard,
             pool=self._buffers_per_length,
             name="_buffers_per_length",
         )
+        for buffer in result:
+            buffer.reset()
+        return result
 
     def _get_checkpoints_and_buffers(
         self,
