@@ -158,8 +158,8 @@ if __name__ == "__main__":
 
     dataset_size = "64k"
     # dataset_size = "128k"
-    is_baseline = False
-    # is_baseline = True
+    # is_baseline = False
+    is_baseline = True
     if is_baseline:
         base_path = base_path / "baseline"
     datasets = [
@@ -184,6 +184,7 @@ if __name__ == "__main__":
     else:
         cases = [
             ("slr_4gpu_cs1024_lr5", "slr_1024"),
+            ("h2o_4gpu_cs1024_lr5", "h2o_1024"),
             ("h2onorm_4gpu_cs1024_lr5", "h2onorm_1024"),
         ]
     result_path = base_path / f"results_{dataset_size}.tex"
