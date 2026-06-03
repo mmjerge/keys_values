@@ -158,8 +158,8 @@ if __name__ == "__main__":
 
     # dataset_size = "64k"
     dataset_size = "128k"
-    # is_baseline = False
-    is_baseline = True
+    is_baseline = False
+    # is_baseline = True
     if is_baseline:
         base_path = base_path / "baseline"
     datasets = [
