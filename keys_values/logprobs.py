@@ -14,39 +14,141 @@
 """
 Memory-efficient per-token log-probability computation using KV cache.
 
-This module provides :func:`chunked_per_token_logps`, which computes
-per-token log-probabilities using KeysAndValues' chunked forward pass
-with a KV cache policy. Instead of materializing the full
-``(batch, seq_length, vocab_size)`` logits tensor, it processes the
-sequence in chunks and extracts log-probs incrementally.
+Implements a :class:`HeadModel` that accumulates per-token log-probs
+(and optionally entropies) instead of a scalar loss. Plug it into
+:class:`LongContextInferenceModel` and the existing chunked forward
+infrastructure handles everything — no new forward loop needed.
 
-Memory usage is bounded by ``O(batch * chunk_size * vocab_size)``
-regardless of total sequence length.
+Usage::
 
-For TRL integration, see :class:`keys_values.finetune.grpo.GRPOLongContextTrainer`.
+    from keys_values.logprobs import compute_logprobs
+
+    logps, entropies = compute_logprobs(
+        gpt_model=model,
+        input_ids=input_ids,
+        targets=completion_ids,
+        cache_name="h2o-torch-quantized8",
+        cache_length=16384,
+        chunk_size=1024,
+    )
 """
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from keys_values.kvcache.factory import (
-    KVCacheFactory,
-    deallocate_kv_cache_buffers_of_model,
-)
-from keys_values.kvcache.stack_layers import DefaultCellBlocks
-from keys_values.long_context import (
-    create_chunk_sizes,
-    get_chunks_for_cells,
-    write_back_cache_buffers,
-)
+from keys_values.config import Config
+from keys_values.head_model import HeadModel
+from keys_values.kvcache.factory import KVCacheFactory
+from keys_values.long_context import LongContextInferenceModel
 from keys_values.model import GPT
 
 
-def chunked_per_token_logps(
+class LogProbsHeadModel(HeadModel):
+    """HeadModel that accumulates per-token log-probs instead of a loss.
+
+    Wraps the same logic as :class:`CrossEntropyOnLogits` but instead of
+    reducing to a scalar loss, it gathers the log-probability of each target
+    token and stores it. After the full chunked forward pass completes,
+    call :meth:`get_results` to retrieve the accumulated tensors.
+
+    This is meant to be used with :class:`LongContextInferenceModel` — the
+    existing chunk/cell/layer loop calls ``forward()`` chunk by chunk, and
+    this class collects log-probs as they come.
+    """
+
+    NAME = "log_probs"
+
+    def __init__(self, config: Config, temperature: float = 1.0,
+                 compute_entropy: bool = False):
+        super().__init__()
+        self._vocab_size = config.padded_vocab_size
+        self._temperature = temperature
+        self._compute_entropy = compute_entropy
+        self._logps_chunks: list[torch.Tensor] = []
+        self._entropy_chunks: list[torch.Tensor] = []
+
+    def needs_logits(self) -> bool:
+        return True
+
+    def forward(
+        self,
+        model_outputs: torch.Tensor,
+        targets: Optional[torch.Tensor],
+        input_pos: int,
+    ) -> torch.Tensor:
+        """Accumulate log-probs for target tokens in this chunk.
+
+        Called by LongContextInferenceModel for each chunk. When targets
+        is None (prompt-only chunk), we skip. When targets are present,
+        we gather log-probs and optionally entropy.
+        """
+        if input_pos == 0:
+            self._logps_chunks.clear()
+            self._entropy_chunks.clear()
+
+        diff = self._check_model_outputs_targets(
+            model_outputs, targets, final_dim=self._vocab_size
+        )
+
+        if diff is not None:
+            logits = model_outputs[:, diff:, :]
+            if self._temperature != 1.0:
+                logits = logits / self._temperature
+
+            # Per-token log-probs
+            log_probs = F.log_softmax(logits, dim=-1)
+            token_logps = torch.gather(
+                log_probs, dim=-1, index=targets.unsqueeze(-1)
+            ).squeeze(-1)
+            self._logps_chunks.append(token_logps)
+
+            if self._compute_entropy:
+                ent = -(log_probs.exp() * log_probs).sum(dim=-1)
+                self._entropy_chunks.append(ent)
+
+        # Return zeros
+        return torch.zeros(
+            model_outputs.shape[0],
+            device=model_outputs.device,
+            dtype=model_outputs.dtype,
+        )
+
+    def num_target_entries(self, targets: torch.Tensor) -> Optional[torch.Tensor]:
+        return None
+
+    def get_results(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Retrieve accumulated log-probs and entropies after forward pass.
+
+        Returns
+        -------
+        logps : torch.Tensor
+            Shape ``(batch_size, num_target_tokens)``.
+        entropies : torch.Tensor | None
+            Shape ``(batch_size, num_target_tokens)`` or None.
+        """
+        logps = torch.cat(self._logps_chunks, dim=1)
+        entropies = (
+            torch.cat(self._entropy_chunks, dim=1)
+            if self._entropy_chunks
+            else None
+        )
+        return logps, entropies
+
+    def _empty_clone(self, device: Optional[torch.device] = None) -> "HeadModel":
+        config = Config()
+        config.padded_vocab_size = self._vocab_size
+        return LogProbsHeadModel(
+            config,
+            temperature=self._temperature,
+            compute_entropy=self._compute_entropy,
+        )
+
+
+def compute_logprobs(
     gpt_model: GPT,
     input_ids: torch.Tensor,
-    logits_to_keep: int,
+    targets: torch.Tensor,
     cache_name: str = "h2o-torch-quantized8",
     cache_length: int = 16384,
     chunk_size: int = 1024,
@@ -54,189 +156,66 @@ def chunked_per_token_logps(
     temperature: float = 1.0,
     compute_entropy: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Compute per-token log-probs using chunked KV-cache forward pass.
+    """Compute per-token log-probs via LongContextInferenceModel.
 
-    This is the KeysAndValues alternative to TRL's full-sequence forward.
-    It processes ``input_ids`` chunk by chunk through the model with a KV
-    cache active, only materializing logits for one chunk at a time. For
-    positions corresponding to completion tokens (the last ``logits_to_keep``
-    positions), it extracts log-probs on the fly.
-
-    Memory usage is bounded by ``O(batch * chunk_size * vocab_size)`` for
-    the logits tensor, regardless of total sequence length.
+    This is the primary entry point. It creates a :class:`LogProbsHeadModel`,
+    plugs it into :class:`LongContextInferenceModel`, and runs the existing
+    chunked forward pass. All KV cache management, chunk/cell grouping, and
+    layer processing is handled by the existing infrastructure.
 
     Args:
-        gpt_model: A KeysAndValues GPT model (with or without KV caches
-            already assigned). If caches are not assigned, they are created
-            and assigned temporarily.
-        input_ids: Full input token IDs (prompt + completion),
-            shape ``(batch_size, seq_length)``.
-        logits_to_keep: Number of completion tokens at the end of the
-            sequence for which log-probs are needed.
-        cache_name: KV cache policy name (e.g. "h2o-torch-quantized8",
-            "lastrec-default", "dense-default").
+        gpt_model: KeysAndValues GPT model.
+        input_ids: Full sequence (prompt + completion), shape
+            ``(batch_size, seq_length)``.
+        targets: Target tokens (right-aligned with input_ids), shape
+            ``(batch_size, num_completion_tokens)``.
+        cache_name: KV cache policy name.
         cache_length: Number of slots in the KV cache.
-        chunk_size: Size of each processing chunk after the prefill.
-        cache_kwargs: Additional arguments for KV cache construction.
-        temperature: Temperature for log-prob computation. Values > 1 make
-            the distribution more uniform. Default 1.0 (no scaling).
-        compute_entropy: If True, also compute Shannon entropy at each
-            completion position.
+        chunk_size: Chunk size for post-prefill processing.
+        cache_kwargs: Extra args for KV cache construction.
+        temperature: Scales logits before softmax.
+        compute_entropy: Whether to also return per-token entropy.
 
     Returns:
-        Tuple of (log_probs, entropies):
-            - log_probs: shape ``(batch_size, logits_to_keep)``
-            - entropies: shape ``(batch_size, logits_to_keep)`` or None
-
-    Example::
-
-        from keys_values.logprobs import chunked_per_token_logps
-        from keys_values.model import GPT
-
-        model = GPT(config)
-        model.load_state_dict(...)
-
-        # input_ids is (batch, prompt_len + completion_len)
-        logps, ent = chunked_per_token_logps(
-            gpt_model=model,
-            input_ids=input_ids,
-            logits_to_keep=completion_len,
-            cache_name="h2o-torch-quantized8",
-            cache_length=16384,
-            chunk_size=1024,
-            compute_entropy=True,
-        )
+        Tuple of (log_probs, entropies).
     """
-    batch_size, seq_length = input_ids.shape
-    device, config = input_ids.device, gpt_model.config
+    batch_size = input_ids.shape[0]
+    config = gpt_model.config
     dtype = next(gpt_model.parameters()).dtype
-    completion_start = seq_length - logits_to_keep
 
-    caches_created = _ensure_kv_caches(
-        gpt_model, cache_name, batch_size, cache_length, dtype, cache_kwargs or {}
+    head = LogProbsHeadModel(
+        config, temperature=temperature, compute_entropy=compute_entropy
     )
-    gpt_model.reset()
 
-    chunk_sizes = create_chunk_sizes(
+    caches_created = False
+    if gpt_model.get_kv_caches()[0] is None:
+        gpt_model.assign_kv_caches(
+            KVCacheFactory.create(
+                gpt_model=gpt_model,
+                name=cache_name,
+                max_batch_size=batch_size,
+                cache_length=cache_length,
+                dtype=dtype,
+                cache_kwargs=cache_kwargs or {},
+            )
+        )
+        caches_created = True
+
+    inference_model = LongContextInferenceModel(
         gpt_model=gpt_model,
-        seq_length=seq_length,
+        head_model=head,
         chunk_size=chunk_size,
-        randomize_chunk_sizes=False,
-    )
-    chunks_per_cell = _partition_into_cells(chunk_sizes, cache_length, config)
-    cells = get_chunks_for_cells(chunks_per_cell, chunk_sizes)
-
-    log_probs = torch.zeros(batch_size, logits_to_keep, device=device, dtype=dtype)
-    entropies = (
-        torch.zeros(batch_size, logits_to_keep, device=device, dtype=dtype)
-        if compute_entropy
-        else None
     )
 
-    blocks = [
-        DefaultCellBlocks(model=gpt_model, first_layer_idx=i, num_layers=1)
-        for i in range(config.n_layer)
-    ]
-    wte, scale = gpt_model.transformer.wte, config.n_embd**0.5
+    # Run the forward pass 
+    inference_model(input_ids=input_ids, targets=targets)
 
-    with torch.no_grad():
-        for cell in cells:
-            start, end = cell.input_range
+    logps, entropies = head.get_results()
 
-            embeddings = wte(input_ids[:, start:end])
-            if config.scale_embeddings:
-                embeddings *= scale
-
-            for block in blocks:
-                embeddings = torch.cat(
-                    [
-                        block.forward(
-                            x=embeddings[:, rs:re, :],
-                            idx=input_ids[:, (start + rs) : (start + re)],
-                        )
-                        for rs, re in cell.chunk_ranges
-                    ],
-                    dim=1,
-                )
-
-            for rs, re in cell.chunk_ranges:
-                abs_s, abs_e = start + rs, start + re
-                p_lo = max(abs_s, completion_start - 1)
-                p_hi = min(abs_e, seq_length - 1)
-                if p_lo >= p_hi:
-                    continue
-
-                chunk_logits = gpt_model.lm_head(
-                    embeddings[:, (p_lo - start) : (p_hi - start), :]
-                )
-                if temperature != 1.0:
-                    chunk_logits /= temperature
-
-                targets = input_ids[:, (p_lo + 1) : (p_hi + 1)]
-                out_slice = slice(
-                    p_lo + 1 - completion_start, p_hi + 1 - completion_start
-                )
-                log_probs[:, out_slice] = _selective_log_softmax(chunk_logits, targets)
-
-                if entropies is not None:
-                    entropies[:, out_slice] = _entropy(chunk_logits)
-
-            del embeddings
-
-    write_back_cache_buffers(gpt_model)
     if caches_created:
+        from keys_values.kvcache.factory import deallocate_kv_cache_buffers_of_model
+
         deallocate_kv_cache_buffers_of_model(gpt_model)
         gpt_model.assign_kv_caches([None] * config.n_layer)
 
-    return log_probs, entropies
-
-
-def _ensure_kv_caches(gpt_model, name, batch_size, length, dtype, kwargs) -> bool:
-    """Assign KV caches if not already present. Returns True if we created them."""
-    if (existing := gpt_model.get_kv_caches())[0] is not None:
-        return False
-    gpt_model.assign_kv_caches(
-        KVCacheFactory.create(
-            gpt_model=gpt_model,
-            name=name,
-            max_batch_size=batch_size,
-            cache_length=length,
-            dtype=dtype,
-            cache_kwargs=kwargs,
-        )
-    )
-    return True
-
-
-def _partition_into_cells(chunk_sizes, cache_length, config):
-    """Partition chunks into cells whose total length ≈ cache_length."""
-    max_cell_len = int(
-        2 * config.n_query_groups * config.head_size / config.n_embd * cache_length
-    )
-    cells, cur_len, cur_n = [], 0, 0
-    for cs in chunk_sizes:
-        if cur_n and cur_len + cs > max_cell_len:
-            cells.append(cur_n)
-            cur_len, cur_n = cs, 1
-        else:
-            cur_len += cs
-            cur_n += 1
-    if cur_n:
-        cells.append(cur_n)
-    return cells
-
-
-def _selective_log_softmax(logits: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """Log-softmax + gather — mirrors TRL's implementation."""
-    if logits.dtype in (torch.float32, torch.float64):
-        selected = torch.gather(logits, -1, index.unsqueeze(-1)).squeeze(-1)
-        return selected - torch.logsumexp(logits, dim=-1)
-    return torch.gather(F.log_softmax(logits, dim=-1), -1, index.unsqueeze(-1)).squeeze(
-        -1
-    )
-
-
-def _entropy(logits: torch.Tensor) -> torch.Tensor:
-    """Shannon entropy in nats from logits, shape (..., vocab) → (...)."""
-    p = F.log_softmax(logits, dim=-1)
-    return -(p.exp() * p).sum(-1)
+    return logps, entropies

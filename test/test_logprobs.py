@@ -14,21 +14,19 @@
 """
 Tests for :mod:`keys_values.logprobs`.
 
-Verifies that ``chunked_per_token_logps`` integrates correctly with the
-KeysAndValues model infrastructure (GPT + KV caches + MHA) and produces
-correct per-token log-probabilities.
+Verifies that ``compute_logprobs`` produces correct per-token
+log-probabilities using the LongContextInferenceModel infrastructure.
 """
 import pytest
 import torch
 
 from keys_values.config import Config
-from keys_values.logprobs import chunked_per_token_logps
-from keys_values.model import GPT
+from keys_values.logprobs import compute_logprobs
 
 
-def _small_config(**overrides) -> Config:
+def _small_config() -> Config:
     """Minimal GPT config for fast CPU tests."""
-    defaults = dict(
+    return Config(
         n_layer=2,
         n_head=4,
         n_embd=64,
@@ -38,40 +36,20 @@ def _small_config(**overrides) -> Config:
         padded_vocab_size=256,
         intermediate_size=128,
     )
-    defaults.update(overrides)
-    return Config(**defaults)
 
 
-def _reference_logps(
-    gpt_model: GPT,
-    input_ids: torch.Tensor,
-    logits_to_keep: int,
-    temperature: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Ground truth: use chunked_per_token_logps with dense cache == seq_length.
+def _make_model():
+    from keys_values.model import GPT
 
-    With a dense cache large enough for the full sequence, there's no
-    eviction — this gives exact log-probs as if we did a single forward pass.
-    """
-    return chunked_per_token_logps(
-        gpt_model=gpt_model,
-        input_ids=input_ids,
-        logits_to_keep=logits_to_keep,
-        cache_name="dense-default",
-        cache_length=input_ids.shape[1],
-        chunk_size=input_ids.shape[1],  # single chunk = full forward
-        temperature=temperature,
-        compute_entropy=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+    config = _small_config()
+    with torch.device("cpu"):
+        model = GPT(config)
+    model.eval()
+    return model, config
 
 
 @pytest.mark.parametrize(
-    "seq_length, logits_to_keep, chunk_size",
+    "seq_length, completion_length, chunk_size",
     [
         (32, 8, 16),
         (64, 16, 8),
@@ -79,30 +57,31 @@ def _reference_logps(
         (100, 30, 20),
     ],
 )
-def test_chunked_matches_dense_full(seq_length, logits_to_keep, chunk_size):
-    """Chunked processing with dense cache should match single-chunk reference.
-
-    Both use a dense cache (no eviction), so the only difference is how many
-    chunks the sequence is split into. Results must be identical.
-    """
+def test_chunked_matches_single_chunk(seq_length, completion_length, chunk_size):
+    """Chunked computation should match single-chunk (full forward) result."""
     torch.manual_seed(42)
-    config = _small_config()
+    model, config = _make_model()
     batch_size = 2
 
-    with torch.device("cpu"):
-        model = GPT(config)
-    model.eval()
-
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length))
+    targets = input_ids[:, -completion_length:]
 
-    # Reference: dense cache, single chunk (full forward)
-    ref_logps, ref_ent = _reference_logps(model, input_ids, logits_to_keep)
-
-    # Under test: dense cache but split into multiple chunks
-    test_logps, test_ent = chunked_per_token_logps(
+    # Reference: dense cache, single large chunk (effectively full forward)
+    ref_logps, ref_ent = compute_logprobs(
         gpt_model=model,
         input_ids=input_ids,
-        logits_to_keep=logits_to_keep,
+        targets=targets,
+        cache_name="dense-default",
+        cache_length=seq_length,
+        chunk_size=seq_length,
+        compute_entropy=True,
+    )
+
+    # Under test: same dense cache but split into multiple chunks
+    test_logps, test_ent = compute_logprobs(
+        gpt_model=model,
+        input_ids=input_ids,
+        targets=targets,
         cache_name="dense-default",
         cache_length=seq_length,
         chunk_size=chunk_size,
@@ -115,26 +94,28 @@ def test_chunked_matches_dense_full(seq_length, logits_to_keep, chunk_size):
 
 @pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
 def test_temperature_scaling(temperature):
-    """Temperature should consistently scale logits before softmax."""
+    """Temperature should consistently scale logits."""
     torch.manual_seed(123)
-    config = _small_config()
-    seq_length, logits_to_keep = 40, 10
+    model, config = _make_model()
 
-    with torch.device("cpu"):
-        model = GPT(config)
-    model.eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 40))
+    targets = input_ids[:, -10:]
 
-    input_ids = torch.randint(0, config.vocab_size, (1, seq_length))
-
-    ref_logps, _ = _reference_logps(
-        model, input_ids, logits_to_keep, temperature
-    )
-    test_logps, _ = chunked_per_token_logps(
+    ref_logps, _ = compute_logprobs(
         gpt_model=model,
         input_ids=input_ids,
-        logits_to_keep=logits_to_keep,
+        targets=targets,
         cache_name="dense-default",
-        cache_length=seq_length,
+        cache_length=40,
+        chunk_size=40,
+        temperature=temperature,
+    )
+    test_logps, _ = compute_logprobs(
+        gpt_model=model,
+        input_ids=input_ids,
+        targets=targets,
+        cache_name="dense-default",
+        cache_length=40,
         chunk_size=16,
         temperature=temperature,
     )
@@ -145,18 +126,15 @@ def test_temperature_scaling(temperature):
 def test_no_entropy_returns_none():
     """When compute_entropy=False, entropies should be None."""
     torch.manual_seed(7)
-    config = _small_config()
-
-    with torch.device("cpu"):
-        model = GPT(config)
-    model.eval()
+    model, config = _make_model()
 
     input_ids = torch.randint(0, config.vocab_size, (1, 32))
+    targets = input_ids[:, -8:]
 
-    _, ent = chunked_per_token_logps(
+    _, ent = compute_logprobs(
         gpt_model=model,
         input_ids=input_ids,
-        logits_to_keep=8,
+        targets=targets,
         cache_name="dense-default",
         cache_length=32,
         chunk_size=16,
@@ -166,21 +144,19 @@ def test_no_entropy_returns_none():
 
 
 def test_caches_cleaned_up():
-    """After chunked_per_token_logps, KV caches should be removed."""
+    """After compute_logprobs, KV caches should be removed."""
     torch.manual_seed(99)
-    config = _small_config()
-
-    with torch.device("cpu"):
-        model = GPT(config)
-    model.eval()
+    model, config = _make_model()
 
     assert model.get_kv_caches()[0] is None
 
     input_ids = torch.randint(0, config.vocab_size, (1, 32))
-    chunked_per_token_logps(
+    targets = input_ids[:, -8:]
+
+    compute_logprobs(
         gpt_model=model,
         input_ids=input_ids,
-        logits_to_keep=8,
+        targets=targets,
         cache_name="dense-default",
         cache_length=32,
         chunk_size=16,
@@ -189,47 +165,41 @@ def test_caches_cleaned_up():
     assert model.get_kv_caches()[0] is None
 
 
-def test_logps_shape():
-    """Output shapes should match (batch_size, logits_to_keep)."""
+def test_output_shapes():
+    """Output shapes should match (batch_size, completion_length)."""
     torch.manual_seed(55)
-    config = _small_config()
-    batch_size, seq_length, logits_to_keep = 3, 50, 15
-
-    with torch.device("cpu"):
-        model = GPT(config)
-    model.eval()
+    model, config = _make_model()
+    batch_size, seq_length, completion_length = 3, 50, 15
 
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length))
+    targets = input_ids[:, -completion_length:]
 
-    logps, ent = chunked_per_token_logps(
+    logps, ent = compute_logprobs(
         gpt_model=model,
         input_ids=input_ids,
-        logits_to_keep=logits_to_keep,
+        targets=targets,
         cache_name="dense-default",
         cache_length=seq_length,
         chunk_size=20,
         compute_entropy=True,
     )
 
-    assert logps.shape == (batch_size, logits_to_keep)
-    assert ent.shape == (batch_size, logits_to_keep)
+    assert logps.shape == (batch_size, completion_length)
+    assert ent.shape == (batch_size, completion_length)
 
 
 def test_logps_are_negative():
     """Log-probabilities should always be <= 0."""
     torch.manual_seed(77)
-    config = _small_config()
-
-    with torch.device("cpu"):
-        model = GPT(config)
-    model.eval()
+    model, config = _make_model()
 
     input_ids = torch.randint(0, config.vocab_size, (2, 40))
+    targets = input_ids[:, -10:]
 
-    logps, _ = chunked_per_token_logps(
+    logps, _ = compute_logprobs(
         gpt_model=model,
         input_ids=input_ids,
-        logits_to_keep=10,
+        targets=targets,
         cache_name="dense-default",
         cache_length=40,
         chunk_size=16,
