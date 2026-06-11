@@ -32,6 +32,7 @@ Usage::
     )
     trainer.train()
 """
+
 from __future__ import annotations
 
 import torch
@@ -127,6 +128,7 @@ class GRPOLongContextTrainer(GRPOTrainer):
             else None
         )
         return logps, entropies
+
 
 def _unwrap(model) -> GPT:
     """Peel wrappers (DDP, PEFT, HF, ...) until we hit a ``GPT`` instance."""

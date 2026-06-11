@@ -17,6 +17,7 @@ Tests for :mod:`keys_values.logprobs`.
 Verifies that ``compute_logprobs`` produces correct per-token
 log-probabilities using the LongContextInferenceModel infrastructure.
 """
+
 import pytest
 import torch
 

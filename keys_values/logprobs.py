@@ -32,6 +32,7 @@ Usage::
         chunk_size=1024,
     )
 """
+
 from typing import Optional, Tuple
 
 import torch
@@ -59,8 +60,9 @@ class LogProbsHeadModel(HeadModel):
 
     NAME = "log_probs"
 
-    def __init__(self, config: Config, temperature: float = 1.0,
-                 compute_entropy: bool = False):
+    def __init__(
+        self, config: Config, temperature: float = 1.0, compute_entropy: bool = False
+    ):
         super().__init__()
         self._vocab_size = config.padded_vocab_size
         self._temperature = temperature
@@ -129,9 +131,7 @@ class LogProbsHeadModel(HeadModel):
         """
         logps = torch.cat(self._logps_chunks, dim=1)
         entropies = (
-            torch.cat(self._entropy_chunks, dim=1)
-            if self._entropy_chunks
-            else None
+            torch.cat(self._entropy_chunks, dim=1) if self._entropy_chunks else None
         )
         return logps, entropies
 
@@ -207,7 +207,7 @@ def compute_logprobs(
         chunk_size=chunk_size,
     )
 
-    # Run the forward pass 
+    # Run the forward pass
     inference_model(input_ids=input_ids, targets=targets)
 
     logps, entropies = head.get_results()
