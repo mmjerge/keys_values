@@ -77,23 +77,20 @@ def _describe(x) -> str:
 
 
 def _describe_metadata(md) -> str:
-    """Pull out the attn-metadata fields we care about for scoring."""
-    fields = [
-        "num_prefills",
-        "num_prefill_tokens",
-        "num_decode_tokens",
-        "num_actual_tokens",
-        "slot_mapping",
-        "block_table",
-        "block_tables",
-        "seq_lens",
-        "query_start_loc",
-    ]
+    """Dump the public tensor/scalar attributes of the attn metadata object."""
     parts = []
-    for f in fields:
-        if hasattr(md, f):
-            parts.append(f"{f}={_describe(getattr(md, f))}")
-    return "; ".join(parts) if parts else f"(no known fields on {type(md).__name__})"
+    for name in sorted(n for n in dir(md) if not n.startswith("_")):
+        try:
+            val = getattr(md, name)
+        except Exception:  # noqa: BLE001
+            continue
+        if callable(val):
+            continue
+        if hasattr(val, "shape") and hasattr(val, "dtype"):
+            parts.append(f"{name}={_describe(val)}")
+        elif isinstance(val, (int, float, bool)) or val is None:
+            parts.append(f"{name}={val!r}")
+    return "\n    ".join(parts) if parts else f"(nothing on {type(md).__name__})"
 
 
 def _wrap_flashinfer_impl() -> None:
@@ -105,20 +102,23 @@ def _wrap_flashinfer_impl() -> None:
 
     def wrapped(self, *args, **kwargs):
         global _log_count
-        if _log_count < _MAX_LOGS:
-            print(f"\n[impl] FlashInferImpl.forward call #{_log_count}")
+        # args: (layer, query, key, value, kv_cache, attn_metadata)
+        attn_metadata = args[5] if len(args) > 5 else None
+        # Skip warmup/profiling calls (no metadata, empty kv_cache).
+        if attn_metadata is not None and _log_count < _MAX_LOGS:
+            kv_cache = args[4] if len(args) > 4 else None
+            query, key, value = args[1], args[2], args[3]
+            print(f"\n[impl] real FlashInferImpl.forward call #{_log_count}")
             print(
                 f"  can_return_lse_for_decode = "
                 f"{getattr(self, 'can_return_lse_for_decode', None)}"
             )
-            for i, a in enumerate(args):
-                desc = _describe(a)
-                print(f"  arg[{i}] = {desc}")
-                # The attention metadata is whichever arg looks like it.
-                if "Metadata" in type(a).__name__ or hasattr(a, "slot_mapping"):
-                    print(f"    metadata: {_describe_metadata(a)}")
-            for k, v in kwargs.items():
-                print(f"  kw[{k}] = {_describe(v)}")
+            print(f"  query = {_describe(query)}")
+            print(f"  key   = {_describe(key)}")
+            print(f"  value = {_describe(value)}")
+            print(f"  kv_cache = {_describe(kv_cache)}")
+            print(f"  attn_metadata ({type(attn_metadata).__name__}):")
+            print(f"    {_describe_metadata(attn_metadata)}")
             _log_count += 1
         return original(self, *args, **kwargs)
 
