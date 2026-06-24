@@ -39,7 +39,6 @@ import argparse
 import os
 
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import sys
@@ -145,6 +144,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         enforce_eager=True,
         enable_prefix_caching=False,
+        attention_backend="FLASHINFER",  # 0.23: EngineArgs field (not an env var)
     )
     out = llm.generate(
         [args.prompt], SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
