@@ -301,13 +301,29 @@ append-only. Candidate approaches, to evaluate empirically:
 - **B. Dense-cache attention backend (Option B)**: faithful per-head eviction,
   most invasive.
 
-### Recommended 4.3 order
-1. Wire blocker 1 first (LSE capture -> score-sum -> `record_block_scores`) and
-   verify scores look sane during generation; this is reusable regardless of how
-   eviction is wired.
+### FlashInfer impl surface (mapped on box, vLLM 0.23)
+`FlashInferImpl.forward(self, layer, query, key, value, kv_cache, attn_metadata,
+*, output, ...)`:
+- `query (T, n_heads, head_size)`, `key/value (T, n_kv_heads, head_size)` for the
+  current step's `T` tokens (a batch spanning prefill + decode requests).
+- `kv_cache (num_blocks, 2, block_size, n_kv_heads, head_size)` - paged K/V.
+- `attn_metadata` (`FlashInferMetadata`): `num_decodes`, `num_decode_tokens`,
+  `num_prefills`, `num_prefill_tokens`, `slot_mapping (T,)`, `use_cascade`.
+  The block table is not a top-level field; it lives in the nested decode/prefill
+  FlashInfer wrapper objects. `can_return_lse_for_decode = True`.
+
+### Recommended 4.3 order and effort
+1. Wire blocker 1 (LSE -> score-sum -> `record_block_scores`). The per-request
+   block mapping comes from `H2OManager.req_to_blocks` (we own it); the hard part
+   is correlating each of the `T` batched tokens/scores back to its request and
+   layer, every step.
 2. Prototype approach A (compaction) on short sequences; compare against the
-   keys_values/LitGPT H2O reference. If compaction can't be made consistent with
-   V1 metadata, escalate to Option B.
+   keys_values/LitGPT H2O reference; escalate to Option B if inconsistent.
+
+A correct in-engine H2O scoring+eviction loop is a multi-day effort (per-request
+score routing across the batched FlashInfer call, plus the unsolved
+arbitrary-eviction "holes" problem). De-risked so far: weights reachable
+(LSE / Q+paged-K), FlashInfer backend works, hooks fire, impl surface mapped.
 
 ## Open questions
 
