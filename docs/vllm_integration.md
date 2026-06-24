@@ -275,8 +275,17 @@ with `return_lse=True` (`vllm/v1/attention/backends/flashinfer.py`), yielding th
 per-query log-sum-exp. With `LSE + Q + K`, per-position weights are
 `exp(q_i·k_j·scale - lse_i)` - the same Q,K,LSE recipe keys_values' FlashInfer
 path already uses, and summable with the existing Triton score-sum. So the plan
-is: force `VLLM_ATTENTION_BACKEND=FLASHINFER`, capture LSE per layer, compute the
-per-position score-sum, and feed `H2OManager.record_block_scores`.
+is: force FlashInfer, capture LSE per layer, compute the per-position score-sum,
+and feed `H2OManager.record_block_scores`.
+
+Step 1 confirmed on box (g5.xlarge, vLLM 0.23): FlashInfer is selected via the
+`EngineArgs` field `attention_backend="FLASHINFER"` (the old
+`VLLM_ATTENTION_BACKEND` env var is gone in 0.23). Forward hooks on the 24
+`Attention` layers install and fire during generation, and output stays correct.
+Foundation harness: `examples/vllm_h2o_probe.py`. Remaining step-2 work: the
+layer forward hook sees Q/output but not LSE, which lives inside the FlashInfer
+impl's run path - so LSE capture needs a hook one level down (on the FlashInfer
+`AttentionImpl.forward` / wrapper `.run`), not the module hook.
 
 ### Blocker 2 - non-prefix eviction in the block table (the hard part)
 vLLM's built-in managers only ever free a contiguous **prefix** (sliding window,
