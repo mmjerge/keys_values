@@ -349,9 +349,72 @@ wrappers with `return_lse=True`, so the log-sum-exp needed to normalize is
 available on the same call. So we neither need a vLLM feature request nor a
 second attention pass; the remaining work is purely *wiring* this into the
 in-engine attention path and mapping per-position scores to blocks (prototyped
-in `examples/vllm_h2o_score_probe.py` on the follow-up branch — gathers a
-request's paged K/V and computes correct per-position mass in-engine for the
-single-sequence decode case).
+in `examples/vllm_h2o_score_probe.py` — gathers a request's paged K/V and
+computes correct per-position mass in-engine for the single-sequence decode
+case).
+
+## H2O wiring (task 4.3): findings and plan
+
+Two sub-problems must be solved to run H2O in-engine; investigation status.
+(Blocker 1 below is the *in-engine wiring* of the weight signal whose math is
+already implemented in the task-3 module above.)
+
+### Blocker 1 - attention weights in-engine (tractable)
+H2O scores need per-KV-position attention mass. FlashAttention (the default
+backend) exposes nothing. But vLLM's **V1 FlashInfer backend** runs its wrappers
+with `return_lse=True` (`vllm/v1/attention/backends/flashinfer.py`), yielding the
+per-query log-sum-exp. With `LSE + Q + K`, per-position weights are
+`exp(q_i·k_j·scale - lse_i)` - the same Q,K,LSE recipe keys_values' FlashInfer
+path already uses, and summable with the existing Triton score-sum. So the plan
+is: force FlashInfer, capture LSE per layer, compute the per-position score-sum,
+and feed `H2OManager.record_block_scores`.
+
+Step 1 confirmed on box (g5.xlarge, vLLM 0.23): FlashInfer is selected via the
+`EngineArgs` field `attention_backend="FLASHINFER"` (the old
+`VLLM_ATTENTION_BACKEND` env var is gone in 0.23). Forward hooks on the 24
+`Attention` layers install and fire during generation, and output stays correct.
+Foundation harness: `examples/vllm_h2o_probe.py`. Remaining step-2 work: the
+layer forward hook sees Q/output but not LSE, which lives inside the FlashInfer
+impl's run path - so LSE capture needs a hook one level down (on the FlashInfer
+`AttentionImpl.forward` / wrapper `.run`), not the module hook.
+
+### Blocker 2 - non-prefix eviction in the block table (the hard part)
+vLLM's built-in managers only ever free a contiguous **prefix** (sliding window,
+chunked-local), replacing it with null blocks; attention then runs over the
+suffix. H2O evicts arbitrary **middle** blocks, leaving holes the block table +
+FlashInfer masking don't natively represent, and V1 block tables are designed
+append-only. Candidate approaches, to evaluate empirically:
+- **A. Block-table compaction**: drop the evicted block from the request's list.
+  The stored K keeps its original RoPE (position is baked into K, not the list
+  index), so attention over the remaining blocks uses correct encodings - this
+  is promising, but `slot_mapping`/`seq_len`/causal-mask metadata must be made
+  consistent, against an append-only assumption.
+- **B. Dense-cache attention backend (Option B)**: faithful per-head eviction,
+  most invasive.
+
+### FlashInfer impl surface (mapped on box, vLLM 0.23)
+`FlashInferImpl.forward(self, layer, query, key, value, kv_cache, attn_metadata,
+*, output, ...)`:
+- `query (T, n_heads, head_size)`, `key/value (T, n_kv_heads, head_size)` for the
+  current step's `T` tokens (a batch spanning prefill + decode requests).
+- `kv_cache (num_blocks, 2, block_size, n_kv_heads, head_size)` - paged K/V.
+- `attn_metadata` (`FlashInferMetadata`): `num_decodes`, `num_decode_tokens`,
+  `num_prefills`, `num_prefill_tokens`, `slot_mapping (T,)`, `use_cascade`.
+  The block table is not a top-level field; it lives in the nested decode/prefill
+  FlashInfer wrapper objects. `can_return_lse_for_decode = True`.
+
+### Recommended 4.3 order and effort
+1. Wire blocker 1 (LSE -> score-sum -> `record_block_scores`). The per-request
+   block mapping comes from `H2OManager.req_to_blocks` (we own it); the hard part
+   is correlating each of the `T` batched tokens/scores back to its request and
+   layer, every step.
+2. Prototype approach A (compaction) on short sequences; compare against the
+   keys_values/LitGPT H2O reference; escalate to Option B if inconsistent.
+
+A correct in-engine H2O scoring+eviction loop is a multi-day effort (per-request
+score routing across the batched FlashInfer call, plus the unsolved
+arbitrary-eviction "holes" problem). De-risked so far: weights reachable
+(LSE / Q+paged-K), FlashInfer backend works, hooks fire, impl surface mapped.
 
 ## Open questions
 
