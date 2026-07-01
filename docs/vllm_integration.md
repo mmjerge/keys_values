@@ -109,10 +109,34 @@ storage is, per layer, a tensor shaped like:
  ^K/V  ^pool     ^tokens/blk ^heads       ^feature
 ```
 
-A **block** is therefore a contiguous slab holding `block_size` consecutive
-tokens' keys and values for **all** KV heads of that layer. In the spike
+In vLLM's **V1 implementation** a block is a contiguous slab holding
+`block_size` consecutive tokens' keys and values for **all** KV heads of that
+layer (heads are the `num_kv_heads` axis *inside* the block, addressed by a
+single per-group block table — not a separate table per head). In the spike
 (Qwen2.5-0.5B) `block_size = 16`, `num_kv_heads = 2`, `head_size = 64`,
 `num_gpu_blocks = 102197`.
+
+**Paper design space vs. vLLM's implementation (review point).** The original
+PagedAttention paper (Kwon et al., *Efficient Memory Management for Large
+Language Model Serving with PagedAttention*, SOSP 2023) notes two valid layouts
+and is explicit that they are interchangeable: KV for all heads can live in
+*one* block, **or** "the key and value vectors at different heads and layers can
+each have a separate block and be managed in separate block tables ... we choose
+the second one for easy implementation." So a block can in principle be scoped
+to a single `(batch, head)` and still hold several tokens — the paper's core
+invariant is only that a block is a **fixed-size** slab of KV for a fixed number
+of tokens, which is what makes on-the-fly memory (re)allocation cheap. Per-head
+block tables are therefore *not* ruled out in principle, and the reviewer is
+right to flag the earlier categorical claim. The constraint we rely on is
+narrower and empirical: **vLLM's V1 attention specs as shipped**
+(`FullAttentionSpec`, `SlidingWindowSpec`, ...) use the all-heads-in-one-block
+layout with a single block table per KV-cache group — confirmed by the spike's
+per-layer tensor shape `(2, num_blocks, block_size, num_kv_heads, head_size)`
+and the single per-request block table. We integrate against that
+implementation, not the paper's full design space, so for our purposes the
+block is the smallest unit across all heads. Splitting per head would mean
+defining per-head KV-cache groups / specs (a much larger change to vLLM's
+manager and metadata machinery), which is out of scope for this bridge.
 
 **Indexing.** To address a single KV vector you need:
 `(layer/group, physical block_id, offset ∈ [0, block_size), kv_head, feature)`.
@@ -137,15 +161,36 @@ not something we choose per policy. Two consequences for us:
 - **Per-request length can vary** — each sequence has its own block table and
   its own block count, so effective `cache_length` differs per request. This is
   the one axis where vLLM is *more* flexible than our dense form.
-- **Per-head length cannot vary** — the block table and `block_size` are shared
-  across all KV heads in a layer, so you cannot free a block for one head while
-  keeping it for another. This is exactly why faithful per-head H2O is
-  impossible at block granularity and pushes H2O toward either a block-level
+- **Per-head length cannot vary** — in vLLM V1 as shipped, the block table and
+  `block_size` are shared across all KV heads in a layer, so you cannot free a
+  block for one head while keeping it for another. (This is an implementation
+  property of vLLM's standard specs, not a hard law of PagedAttention — see the
+  paper-design-space note above — but it is the reality the bridge targets.)
+  This is why faithful per-head H2O is not expressible at block granularity
+  under the existing specs and pushes H2O toward either a block-level
   approximation (Option A) or the dense-cache backend (Option B).
 
 Positional policies (lastrec, smart-lastrec) only need to decide *which logical
 positions to drop*, which maps cleanly onto freeing blocks — so they fit the
 paged model well. Score-based per-head policies (H2O) are the hard case.
+
+**Upstream confirmation (vLLM forum + RFCs).** This is not just our reading of
+the code — it is a known, acknowledged vLLM limitation. Per the vLLM forum
+thread [*Sparse attention (e.g., H2O)*](https://discuss.vllm.ai/t/sparse-attention-e-g-h2o/2745),
+vLLM allocates and manages KV blocks at the sequence level and **all heads in a
+layer share the same block layout**, so eviction/compaction is performed at the
+block level affecting all heads together; per-head sparse KV eviction (as in
+H2O) is *not* natively supported in mainline, and the only current workaround
+(`block_size=1`) is inefficient and not production-scalable. Supporting head- or
+layer-wise sparse KV would require redesigning the block manager and memory
+layout. This is tracked upstream in:
+
+- [RFC #10646 — Support KV Cache Compaction](https://github.com/vllm-project/vllm/issues/10646)
+- [RFC #12254 — Sparse KV cache management framework](https://github.com/vllm-project/vllm/issues/12254)
+- [RFC #5751 — Support sparse KV cache framework](https://github.com/vllm-project/vllm/issues/5751)
+
+So the block-level H2O plan (below) is the correct target given current vLLM;
+true per-head eviction depends on upstream work landing one of these RFCs.
 
 ## vLLM 0.23 / V1 extension points (mapped from source)
 
@@ -201,6 +246,20 @@ first policy that is genuinely unique to keys_values. Only then evaluate
 whether H2O can be approximated at block granularity (Option A) or needs the
 dense-cache backend (Option B).
 
+**Decision (review, mseeger).** For vLLM specifically we agreed to do H2O at
+**block granularity** — score and evict/overwrite whole blocks rather than
+single-token KV entries — and to *not* chase faithful per-head, per-token
+fidelity inside vLLM (that is what the dense keys_values stack is for). This
+fits PagedAttention's fixed-size-block model directly: aggregate H2O scores to
+the block level (e.g. sum/mean over the `block_size` tokens, and over heads
+within the group, since the shipped specs share one block table across heads),
+then release the lowest-scoring blocks back to the pool. So Option A is the
+target for H2O too; Option B (dense backend) is no longer on the critical path
+and is kept only as a fallback if block-level accuracy proves inadequate. The
+remaining hard part is mechanical, not conceptual — vLLM's managers only free a
+contiguous *prefix*, whereas H2O frees arbitrary *middle* blocks (see "Blocker
+2" below).
+
 ## Spike results (Qwen2.5-0.5B-Instruct, 1× A10G, vLLM 0.23.0 / V1)
 
 Captured by `examples/vllm_spike.py`:
@@ -233,11 +292,15 @@ Implications:
    block model: per-request block tables already give us per-request variation,
    and we never need to diverge across heads. Implement `SmartLastRecManager` as
    a subclass of `LastRecManager` (`keys_values/vllm/managers.py` is structured
-   to extend here). Upstream `smart-lastrec` is being refactored for left
-   padding; align the bridge with that once it lands.
-4. **H2O**: only after the positional policies land. Decide block-granularity
-   approximation vs. dense-cache backend; route attention-weight computation
-   through the existing FlashInfer + Triton score-sum machinery.
+   to extend here). The upstream `smart-lastrec` (`slr`) refactor for left
+   padding has now landed (per review, it "does not buy much"), so there is no
+   remaining upstream dependency — the bridge can integrate it directly.
+4. **H2O** (block-granularity, per review decision): only after the positional
+   policies land. Score and evict **whole blocks** (aggregate H2O scores over
+   the block's tokens and over heads in the group); route attention-weight
+   computation through the existing FlashInfer + Triton score-sum machinery. The
+   dense-cache backend (Option B) is a fallback only if block-level accuracy is
+   inadequate.
 5. **Eval + parity tests** vs. the LitGPT inference path, then long-context
    benchmarks.
 
@@ -264,9 +327,37 @@ Open follow-up: this uses monkeypatches in an experiment harness. A production
 path should register via the `register_custom_kv_cache_specs` platform hook and a
 config flag rather than patching `get_kv_cache_spec`/layer attributes.
 
+## Attention-weight extraction (task 3, implemented)
+
+H2O scores each KV slot by the attention mass it receives, summed over the query
+axis (and over the query heads sharing a KV head, for GQA). The bridge now ships
+this in `keys_values/vllm/attention.py`:
+
+- `reference_summed_attention(...)` — a pure-torch reference (the contract),
+  returning `(attn_output, summed_weights)` with `summed_weights` of shape
+  `(batch, n_kv_heads, kv_len)` in float32. GPU-free and unit-tested as the
+  source of truth (`test/vllm/test_attn_weights.py`).
+- `summed_attention_weights(...)` — dispatches to keys_values' existing
+  FlashInfer + Triton score-sum path when available (CUDA + fp16/bf16 + vendored
+  kernels), and falls back to the reference otherwise. Validated against the
+  reference on GPU.
+
+Key point for the "how do we get summed weights in vLLM?" question: this path
+returns the weights in a **single** FlashInfer SDPA call (`return_attn_weights=
+True`), not two attention passes — vLLM's V1 FlashInfer backend already runs its
+wrappers with `return_lse=True`, so the log-sum-exp needed to normalize is
+available on the same call. So we neither need a vLLM feature request nor a
+second attention pass; the remaining work is purely *wiring* this into the
+in-engine attention path and mapping per-position scores to blocks (prototyped
+in `examples/vllm_h2o_score_probe.py` — gathers a request's paged K/V and
+computes correct per-position mass in-engine for the single-sequence decode
+case).
+
 ## H2O wiring (task 4.3): findings and plan
 
-Two sub-problems must be solved to run H2O in-engine; investigation status:
+Two sub-problems must be solved to run H2O in-engine; investigation status.
+(Blocker 1 below is the *in-engine wiring* of the weight signal whose math is
+already implemented in the task-3 module above.)
 
 ### Blocker 1 - attention weights in-engine (tractable)
 H2O scores need per-KV-position attention mass. FlashAttention (the default
@@ -329,7 +420,13 @@ arbitrary-eviction "holes" problem). De-risked so far: weights reachable
 
 - Can a `SingleTypeKVCacheManager` express keys_values eviction without touching
   the block pool internals?
-- H2O at block granularity — acceptable accuracy, or is per-head eviction
-  (Option B) required?
-- Getting summed attention weights in V1 without a custom kernel per backend.
+- H2O at block granularity — **decided (review): go block-level**, evicting
+  whole blocks rather than per-head/per-token; remaining question is how much
+  accuracy that costs vs. the dense LitGPT reference, measured in phase 5.
+  Option B (per-head dense backend) is a fallback only.
+- Getting summed attention weights in V1 — **addressed** for the FlashInfer
+  backend: keys_values' FlashInfer + Triton score-sum path returns them in a
+  single SDPA call (see "Attention-weight extraction" above). Open part is
+  per-backend coverage (only FlashInfer is wired; FlashAttention still exposes
+  nothing) and in-engine wiring of the score → block mapping.
 - CUDA-graph capture with a dynamically-evicting custom manager.
