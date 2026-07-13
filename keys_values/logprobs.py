@@ -43,6 +43,7 @@ from keys_values.head_model import HeadModel
 from keys_values.kvcache.factory import KVCacheFactory
 from keys_values.long_context import LongContextInferenceModel
 from keys_values.model import GPT
+from keys_values.utils import VerbosityLevels
 
 
 class LogProbsHeadModel(HeadModel):
@@ -155,6 +156,7 @@ def compute_logprobs(
     cache_kwargs: Optional[dict] = None,
     temperature: float = 1.0,
     compute_entropy: bool = False,
+    verbose: VerbosityLevels = VerbosityLevels.SOME,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute per-token log-probs via LongContextInferenceModel.
 
@@ -175,6 +177,7 @@ def compute_logprobs(
         cache_kwargs: Extra args for KV cache construction.
         temperature: Scales logits before softmax.
         compute_entropy: Whether to also return per-token entropy.
+        verbose: Verbosity level for the underlying inference model.
 
     Returns:
         Tuple of (log_probs, entropies).
@@ -205,6 +208,7 @@ def compute_logprobs(
         gpt_model=gpt_model,
         head_model=head,
         chunk_size=chunk_size,
+        verbose=verbose,
     )
 
     # Run the forward pass
