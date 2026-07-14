@@ -961,11 +961,16 @@ class LongContextInferenceModel(GPTAndHeadModel):
                     )
 
                 if compute_loss:
+                    # Apply the final norm before the head, matching GPT.forward
+                    # and the gradient path (kvcache/gradient/accumulate.py).
+                    # The layer-input checkpoint above keeps the pre-norm
+                    # activations, so gradient checkpointing stays consistent.
+                    normed = self.gpt_model.transformer.ln_f(embeddings)
                     # Head model
                     input_pos = start
                     for rel_start, rel_end in chunks_for_cell.chunk_ranges:
                         ch_size = rel_end - rel_start
-                        output_chunk = embeddings[:, rel_start:rel_end, :]
+                        output_chunk = normed[:, rel_start:rel_end, :]
                         if self.head_model.needs_logits():
                             loss_part = compute_loss_with_limited_logits_tensor(
                                 gpt_model=self.gpt_model,
@@ -995,10 +1000,11 @@ class LongContextInferenceModel(GPTAndHeadModel):
                             )
                 else:
                     # `logits_final_position` has final layer outputs for last
-                    # position. Map to logits
+                    # position. Apply the final norm, then map to logits
+                    # (matching GPT.forward).
                     if logits_final_position is not None:
                         logits_final_position = self.gpt_model.lm_head(
-                            logits_final_position
+                            self.gpt_model.transformer.ln_f(logits_final_position)
                         )
 
         if compute_loss:
