@@ -176,7 +176,9 @@ def main() -> None:
     eos_id = int(tokenizer.eos_id) if tokenizer.eos_id is not None else None
 
     gpt_model = build_model(checkpoint_dir, fabric, dtype).to(fabric.device)
-    snapshot = {k: v.detach().clone() for k, v in gpt_model.state_dict().items()}
+    # Keep the reset snapshot on CPU so it doesn't consume GPU memory (matters
+    # for larger models). load_state_dict copies back to the model's device.
+    snapshot = {k: v.detach().cpu().clone() for k, v in gpt_model.state_dict().items()}
     reward_fn = make_reward_len(tokenizer, args.max_new_tokens, pad_id)
 
     print(f"\nmodel={args.model}  device={args.device}  batch={args.prompts_per_step*args.group_size}"
