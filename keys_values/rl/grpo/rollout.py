@@ -170,6 +170,7 @@ def generate_completions_with_logprobs(
         ignore_index=pad_token_id,
         deallocate_cache_buffers=True,
         return_logprobs=True,
+        no_inference_mode=True,  # buffers are updated in place by the grad pass
     ):
         tok_chunks.append(tokens)
         logp_chunks.append(logps)

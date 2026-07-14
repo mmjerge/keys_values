@@ -247,8 +247,45 @@ def generate_fn(
         deallocate_kv_cache_buffers_of_model(model.gpt_model)
 
 
-@torch.inference_mode()
 def batched_generate_fn(
+    model: LongContextInferenceModel,
+    prompts: torch.Tensor,
+    max_returned_tokens: int,
+    *,
+    ignore_index: int = -100,
+    sample_args: Union[list[dict], dict],
+    stop_tokens: Tuple[List[int], ...] = (),
+    deallocate_cache_buffers: bool = True,
+    return_logprobs: bool = False,
+    no_inference_mode: bool = False,
+) -> Iterator[torch.Tensor]:
+    """Generate tokens for a batch of prompts (see :func:`_batched_generate_impl`).
+
+    ``no_inference_mode``: when ``True``, run under ``torch.no_grad`` instead of
+    ``torch.inference_mode``. Required when the KV-cache buffers written during
+    generation are subsequently updated in place by a gradient pass (RL
+    rollouts). Tensors created or moved under ``inference_mode`` -- e.g. the
+    lazy device conversion of cache buffers in ``KVCache._convert_or_check_device``
+    on the first forward -- become "inference tensors" that cannot be modified
+    in place outside inference mode, which breaks the following training
+    forward/backward. Eval and generation-only callers keep the default (faster)
+    inference mode.
+    """
+    ctx = torch.no_grad() if no_inference_mode else torch.inference_mode()
+    with ctx:
+        yield from _batched_generate_impl(
+            model,
+            prompts,
+            max_returned_tokens,
+            ignore_index=ignore_index,
+            sample_args=sample_args,
+            stop_tokens=stop_tokens,
+            deallocate_cache_buffers=deallocate_cache_buffers,
+            return_logprobs=return_logprobs,
+        )
+
+
+def _batched_generate_impl(
     model: LongContextInferenceModel,
     prompts: torch.Tensor,
     max_returned_tokens: int,
