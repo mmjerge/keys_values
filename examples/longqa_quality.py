@@ -120,25 +120,25 @@ def main() -> None:
 
     examples = build_dataset(tokenizer, prompt_style.apply, args.context_len,
                              args.n_examples, seed=args.seed, device=fabric.device)
-    actual_len = int(sum(e.prompt_ids.size(0) for e in examples) / len(examples))
+    lens = [int(e.prompt_ids.size(0)) for e in examples]
+    max_len, avg_len = max(lens), int(sum(lens) / len(lens))
+    # Dense cache must hold the LONGEST prompt in any batch (+ generated tokens).
+    dense_cl = max_len + args.max_new_tokens + 8
     print(f"\nmodel={args.model}  device={args.device}  target_ctx={args.context_len}  "
-          f"actual_ctx~{actual_len}  n={args.n_examples}\n")
-
-    configs = [("dense-default", actual_len + args.max_new_tokens + 8)]
-    configs += [(f"h2o-torch-quantized8", b) for b in budgets]
+          f"actual_ctx: avg~{avg_len} max={max_len}  n={args.n_examples}\n")
 
     print(f"{'cache':>26} {'cache_len':>10} | {'accuracy':>8}")
     print("-" * 50)
-    # dense baseline
-    acc = eval_accuracy(gpt_model, examples, "dense-default", actual_len + args.max_new_tokens + 8,
+    # dense baseline (full attention)
+    acc = eval_accuracy(gpt_model, examples, "dense-default", dense_cl,
                         dtype, args.max_new_tokens, args.chunk_size, args.batch_size,
                         tokenizer, pad_id, eos_id, fabric)
-    print(f"{'dense-default':>26} {actual_len + args.max_new_tokens + 8:>10} | {acc:>8.3f}")
+    print(f"{'dense-default':>26} {dense_cl:>10} | {acc:>8.3f}  (baseline)")
     for b in budgets:
         acc = eval_accuracy(gpt_model, examples, "h2o-torch-quantized8", b, dtype,
                             args.max_new_tokens, args.chunk_size, args.batch_size,
                             tokenizer, pad_id, eos_id, fabric)
-        evicts = "evicts" if b < actual_len else "no-evict"
+        evicts = "evicts" if b < max_len else "no-evict"
         print(f"{'h2o-torch-quantized8':>26} {b:>10} | {acc:>8.3f}  ({evicts})")
     print("\nDone.")
 
