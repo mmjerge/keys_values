@@ -66,8 +66,11 @@ def eval_accuracy(gpt_model, examples, cache_name, cache_length, dtype,
         batch = examples[i:i + batch_size]
         prompt_ids = left_pad([e.prompt_ids for e in batch], pad_id).to(fabric.device)
         gpt_model.max_seq_length = int(prompt_ids.shape[1]) + max_new
+        # A processing chunk cannot exceed the cache's forward capacity, so cap
+        # it to the (possibly small) cache length.
+        eff_chunk = min(chunk_size, cache_length)
         inf = LongContextInferenceModel(gpt_model, head_model=None,
-                                        chunk_size=chunk_size, verbose=VerbosityLevels.NONE)
+                                        chunk_size=eff_chunk, verbose=VerbosityLevels.NONE)
         completions = generate_completions(
             model=inf, prompt_ids=prompt_ids, max_new_tokens=max_new,
             temperature=1.0, top_k=1, top_p=1.0, eos_token_id=eos_id, pad_token_id=pad_id,
