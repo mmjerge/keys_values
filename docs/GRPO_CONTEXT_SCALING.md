@@ -32,22 +32,27 @@ Reproduce with `examples/grpo_context_sweep.py`.
 | 24,576  | dense            | —    | —     | **OOM** | **OOM** |
 | 24,576  | H2O (cl=4096)    | 12115 | 52404 | 64629 | 19.21† |
 | 32,768  | dense            | —    | —     | **OOM** | **OOM** |
-| 32,768  | H2O (cl=4096)    | 15169 | 70693 | 86007 | 19.23† |
+| 32,768  | H2O (cl=4096)    | 15169 | 70693 | 86007 | 14.89‡ |
 
 \* At 2k the H2O budget (4096) ≥ sequence, so no eviction occurs — H2O runs as a
 dense cache plus scoring overhead (same memory, slower). Eviction only kicks in
 once context exceeds the budget.
 
-† See the memory caveat below: peaks for configs that run **after** a dense OOM
-are inflated by residual allocation from the failed config (all configs share one
-process). H2O's cache is fixed-size; its clean peak is ~14.8 GB (see 8k–16k).
+† In-run peaks for configs that execute **after** a dense OOM are inflated by
+residual allocation from the failed config (all configs share one process): the
+24,576 and 32,768 H2O rows reported 19.21 / 19.23 GB in the sweep.
+
+‡ Re-measured in a **fresh process**, 32,768 H2O peaks at **14.89 GB** — i.e.
+H2O's footprint is essentially flat (~14.9 GB) from 2k to 32k. The fixed 4096-slot
+cache means memory does not grow with context.
 
 ## Takeaways
 
 - **Memory (headline)**: dense peak grows with context (14.3 → 16.4 → 19.8 GB)
-  and **OOMs at 24k and 32k on the 24 GB A10G**. H2O's cache is bounded, so it
-  **completes at every length, including 32k** — i.e. sparse attention runs where
-  full attention does not fit at all on the same GPU.
+  and **OOMs at 24k and 32k on the 24 GB A10G**. H2O's footprint stays **flat at
+  ~14.9 GB from 2k to 32k** (fixed 4096-slot cache), so it **completes at every
+  length, including 32k** — i.e. sparse attention runs where full attention does
+  not fit at all on the same GPU.
 - **Speed**: where both fit (≤16k), H2O is ~1.3–1.5× slower than dense — the cost
   of attention-weight scoring, eviction, and the quantized-cache backward, only
   partly offset by FlashInfer. This is far from a pathological slowdown; the
