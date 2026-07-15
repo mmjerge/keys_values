@@ -97,7 +97,8 @@ def run_one(gpt_model, snapshot, fabric, dtype, prompt_ids, reward_fn,
     a metrics dict, or {'oom': True} if the config runs out of memory."""
     is_cuda = fabric.device.type == "cuda"
     try:
-        gpt_model.load_state_dict(snapshot, strict=True)
+        if snapshot is not None:
+            gpt_model.load_state_dict(snapshot, strict=True)
         deallocate_kv_cache_buffers_of_model(gpt_model)
         batch_size = args.prompts_per_step * args.group_size
         gpt_model.assign_kv_caches(
@@ -159,6 +160,13 @@ def main() -> None:
     p.add_argument("--layers-per-cell", type=int, default=1)
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--iters", type=int, default=3)
+    p.add_argument(
+        "--no-reset",
+        action="store_true",
+        help="Skip the per-config weight-reset snapshot. Saves ~model-size of "
+        "CPU RAM (needed for large models on small-RAM hosts); weights drift "
+        "negligibly at the tiny profiling LR.",
+    )
     p.add_argument("--access-token", default=None)
     args = p.parse_args()
 
@@ -176,9 +184,15 @@ def main() -> None:
     eos_id = int(tokenizer.eos_id) if tokenizer.eos_id is not None else None
 
     gpt_model = build_model(checkpoint_dir, fabric, dtype).to(fabric.device)
-    # Keep the reset snapshot on CPU so it doesn't consume GPU memory (matters
-    # for larger models). load_state_dict copies back to the model's device.
-    snapshot = {k: v.detach().cpu().clone() for k, v in gpt_model.state_dict().items()}
+    # Keep the reset snapshot on CPU so it doesn't consume GPU memory. Skip it
+    # entirely with --no-reset to save host RAM (a full state-dict clone is
+    # ~model-size; on small-RAM hosts a large model otherwise triggers the OS
+    # OOM-killer). Weights drift negligibly at the profiling LR.
+    snapshot = (
+        None
+        if args.no_reset
+        else {k: v.detach().cpu().clone() for k, v in gpt_model.state_dict().items()}
+    )
     reward_fn = make_reward_len(tokenizer, args.max_new_tokens, pad_id)
 
     print(f"\nmodel={args.model}  device={args.device}  batch={args.prompts_per_step*args.group_size}"
