@@ -90,15 +90,23 @@ def main() -> None:
     p.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     p.add_argument("--context-len", type=int, default=8192)
     p.add_argument("--n-examples", type=int, default=40)
-    p.add_argument("--h2o-budgets", default="1024,2048,4096")
+    p.add_argument("--tasks", default="needle_last,needle_first,recency")
+    p.add_argument(
+        "--caches",
+        default="h2o-torch-quantized8,smart-lastrec-torch-quantized8,lastrec-torch-quantized8",
+        help="Sparse eviction policies to compare against the dense baseline.",
+    )
+    p.add_argument("--h2o-budgets", default="1024,2048")
     p.add_argument("--max-new-tokens", type=int, default=16)
-    p.add_argument("--chunk-size", type=int, default=1024)
+    p.add_argument("--chunk-size", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--access-token", default=None)
     args = p.parse_args()
 
     budgets = [int(x) for x in args.h2o_budgets.split(",")]
+    task_modes = [t.strip() for t in args.tasks.split(",")]
+    sparse_caches = [c.strip() for c in args.caches.split(",")]
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
     fabric = L.Fabric(devices=1, accelerator=args.device,
                       precision="32-true" if args.device == "cpu" else "bf16-true")
@@ -121,29 +129,33 @@ def main() -> None:
     load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
     gpt_model.to(fabric.device)
 
-    examples = build_dataset(tokenizer, prompt_style.apply, args.context_len,
-                             args.n_examples, seed=args.seed, device=fabric.device)
-    lens = [int(e.prompt_ids.size(0)) for e in examples]
-    max_len, avg_len = max(lens), int(sum(lens) / len(lens))
-    # Dense cache must hold the LONGEST prompt in any batch (+ generated tokens).
-    dense_cl = max_len + args.max_new_tokens + 8
     print(f"\nmodel={args.model}  device={args.device}  target_ctx={args.context_len}  "
-          f"actual_ctx: avg~{avg_len} max={max_len}  n={args.n_examples}\n")
+          f"n={args.n_examples}  budgets={budgets}")
+    print("accuracy = substring exact-match of the retrieved value\n")
 
-    print(f"{'cache':>26} {'cache_len':>10} | {'accuracy':>8}")
-    print("-" * 50)
-    # dense baseline (full attention)
-    acc = eval_accuracy(gpt_model, examples, "dense-default", dense_cl,
-                        dtype, args.max_new_tokens, args.chunk_size, args.batch_size,
-                        tokenizer, pad_id, eos_id, fabric)
-    print(f"{'dense-default':>26} {dense_cl:>10} | {acc:>8.3f}  (baseline)")
-    for b in budgets:
-        acc = eval_accuracy(gpt_model, examples, "h2o-torch-quantized8", b, dtype,
-                            args.max_new_tokens, args.chunk_size, args.batch_size,
-                            tokenizer, pad_id, eos_id, fabric)
-        evicts = "evicts" if b < max_len else "no-evict"
-        print(f"{'h2o-torch-quantized8':>26} {b:>10} | {acc:>8.3f}  ({evicts})")
-    print("\nDone.")
+    def run(examples, cache, cl):
+        return eval_accuracy(gpt_model, examples, cache, cl, dtype, args.max_new_tokens,
+                             args.chunk_size, args.batch_size, tokenizer, pad_id, eos_id, fabric)
+
+    for mode in task_modes:
+        examples = build_dataset(tokenizer, prompt_style.apply, args.context_len,
+                                 args.n_examples, seed=args.seed, device=fabric.device,
+                                 mode=mode)
+        lens = [int(e.prompt_ids.size(0)) for e in examples]
+        max_len = max(lens)
+        dense_cl = max_len + args.max_new_tokens + 8
+        print(f"### task={mode}  (actual_ctx max={max_len})")
+        hdr = f"{'policy':>28} {'budget':>7} | {'accuracy':>8}"
+        print(hdr); print("-" * len(hdr))
+        dense_acc = run(examples, "dense-default", dense_cl)
+        print(f"{'dense (full attention)':>28} {'full':>7} | {dense_acc:>8.3f}  <- baseline")
+        for cache in sparse_caches:
+            for b in budgets:
+                acc = run(examples, cache, b)
+                short = cache.split("-torch")[0].split("-default")[0]
+                print(f"{short:>28} {b:>7} | {acc:>8.3f}  ({acc - dense_acc:+.3f} vs dense)")
+        print()
+    print("Done.")
 
 
 if __name__ == "__main__":

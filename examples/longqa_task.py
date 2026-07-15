@@ -49,6 +49,13 @@ def _rand_value(rng: random.Random) -> str:
     return str(rng.randint(100000, 999999))
 
 
+TASK_MODES = ("needle_last", "needle_first", "recency")
+
+
+def _filler_line(rng: random.Random) -> str:
+    return f"The value for key '{_rand_key(rng)}' is {_rand_value(rng)}."
+
+
 def build_example(
     tokenizer: Tokenizer,
     apply_prompt_style,
@@ -56,46 +63,69 @@ def build_example(
     rng: random.Random,
     device=None,
     needle_frac: float | None = None,
+    mode: str = "needle_last",
 ) -> QAExample:
-    """Build one key-value retrieval example of ~``context_len`` tokens."""
+    """Build one key-value QA example of ~``context_len`` tokens.
+
+    Modes probe different points on the sparse-attention quality frontier:
+
+    - ``needle_last``:  records, then the question at the end. The target record
+      is at a random position and is NOT known while reading the records --
+      H2O's worst case (it can't know which record matters during prefill).
+    - ``needle_first``: the question is stated *before* the records, so the model
+      (and thus H2O's attention-weight scoring) can attend to the relevant
+      record during prefill. Tests whether query-awareness rescues H2O.
+    - ``recency``:      the answer is the value in the *last* record. Recency-
+      keeping policies (lastrec / H2O's recent window) should retain it.
+    """
+    assert mode in TASK_MODES, mode
     question_key = _rand_key(rng)
     target = _rand_value(rng)
-    if needle_frac is None:
-        needle_frac = rng.uniform(0.15, 0.85)
-
-    question = (
-        f"\n\nQuestion: what is the value for key '{question_key}'? "
-        "Reply with only the value.\nAnswer:"
-    )
-    # Budget for filler tokens (leave room for question + chat template).
-    q_tokens = int(tokenizer.encode(question).size(0))
-    filler_budget = max(context_len - q_tokens - 32, 32)
-
-    lines: List[str] = []
-    tok_count = 0
-    # Placeholder for where the needle goes; fill around it.
     needle_line = f"The value for key '{question_key}' is {target}."
-    needle_inserted = False
-    while tok_count < filler_budget:
-        # Insert the needle once we pass the requested fraction.
-        if not needle_inserted and tok_count >= needle_frac * filler_budget:
-            line = needle_line
-            needle_inserted = True
-        else:
-            line = f"The value for key '{_rand_key(rng)}' is {_rand_value(rng)}."
-        lines.append(line)
-        tok_count += int(tokenizer.encode(" " + line).size(0))
-    if not needle_inserted:
-        lines.insert(len(lines) // 2, needle_line)
 
-    body = (
-        "Below is a list of key-value records. Read them and answer the "
-        "question at the end.\n\n" + " ".join(lines) + question
-    )
-    prompt_text = apply_prompt_style(body)
-    ids = tokenizer.encode(prompt_text, device=device)
+    def assemble(prefix: str, suffix: str, place) -> str:
+        budget = max(context_len - int(tokenizer.encode(prefix + suffix).size(0)) - 32, 32)
+        lines: List[str] = []
+        tok = 0
+        placed = False
+        while tok < budget:
+            if place == "here" and not placed and tok >= (needle_frac or 0.5) * budget:
+                line, placed = needle_line, True
+            elif place == "end":
+                line = _filler_line(rng)
+            else:
+                line = _filler_line(rng)
+            lines.append(line)
+            tok += int(tokenizer.encode(" " + line).size(0))
+        if place == "here" and not placed:
+            lines.insert(len(lines) // 2, needle_line)
+        if place == "end":
+            lines.append(needle_line)  # the needle IS the most recent record
+        return " ".join(lines)
+
+    if mode == "needle_last":
+        if needle_frac is None:
+            needle_frac = rng.uniform(0.15, 0.85)
+        prefix = ("Below is a list of key-value records. Read them and answer "
+                  "the question at the end.\n\n")
+        suffix = (f"\n\nQuestion: what is the value for key '{question_key}'? "
+                  "Reply with only the value.\nAnswer:")
+        body = prefix + assemble(prefix, suffix, "here") + suffix
+    elif mode == "needle_first":
+        needle_frac = rng.uniform(0.15, 0.85)
+        prefix = (f"Find the value for key '{question_key}' in the records below.\n\n")
+        suffix = (f"\n\nThe value for key '{question_key}' is:")
+        body = prefix + assemble(prefix, suffix, "here") + suffix
+    else:  # recency
+        needle_frac = 1.0
+        prefix = ("Below is a list of key-value records.\n\n")
+        suffix = ("\n\nQuestion: what is the value in the LAST record above? "
+                  "Reply with only the value.\nAnswer:")
+        body = prefix + assemble(prefix, suffix, "end") + suffix
+
+    ids = tokenizer.encode(apply_prompt_style(body), device=device)
     return QAExample(prompt_ids=ids, target=target, key=question_key,
-                     needle_frac=needle_frac)
+                     needle_frac=needle_frac or 0.5)
 
 
 def build_dataset(
@@ -105,10 +135,12 @@ def build_dataset(
     n_examples: int,
     seed: int = 0,
     device=None,
+    mode: str = "needle_last",
 ) -> List[QAExample]:
     rng = random.Random(seed)
     return [
-        build_example(tokenizer, apply_prompt_style, context_len, rng, device=device)
+        build_example(tokenizer, apply_prompt_style, context_len, rng,
+                      device=device, mode=mode)
         for _ in range(n_examples)
     ]
 
