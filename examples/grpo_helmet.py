@@ -137,6 +137,8 @@ def main() -> None:
     p.add_argument("--reward", choices=["em", "f1", "em_f1"], default="em_f1",
                    help="'em_f1' = EM + 0.2*token-F1 (EM-anchored, dense signal); "
                         "'f1' = max(EM, F1); 'em' = binary exact match.")
+    p.add_argument("--adv-mode", choices=["grpo", "rloo"], default="grpo",
+                   help="Group advantage: GRPO z-normalization or RLOO leave-one-out.")
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--steps", type=int, default=150)
     p.add_argument("--lr", type=float, default=1e-6)
@@ -244,7 +246,7 @@ def main() -> None:
                 layers_per_cell=args.layers_per_cell, temperature=args.temperature,
                 eos_token_id=eos_id, pad_token_id=pad_id,
                 zero_grad=(k == 0), optimizer_step=(k == K - 1),
-                grad_scale=1.0 / K))
+                grad_scale=1.0 / K, advantage_mode=args.adv_mode))
             micro[-1]["prompt_len"] = int(prompt_ids.shape[1])
         m = {
             "step": step,

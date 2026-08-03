@@ -69,13 +69,13 @@ def compute_group_advantages(
     rewards: torch.Tensor,
     group_size: int,
     eps: float = 1e-8,
+    mode: str = "grpo",
 ) -> torch.Tensor:
-    """Compute group-relative advantages, the core of GRPO.
+    """Compute group-relative advantages.
 
     Rewards are assumed laid out as ``num_groups`` contiguous groups of
     ``group_size`` completions each (the standard GRPO layout: ``G``
-    completions per prompt). Within each group, advantages are the rewards
-    normalized to zero mean and unit standard deviation.
+    completions per prompt).
 
     Parameters
     ----------
@@ -84,13 +84,21 @@ def compute_group_advantages(
     group_size : int
         Number of completions per prompt (``G`` in the GRPO paper).
     eps : float
-        Numerical stabilizer for the per-group std.
+        Numerical stabilizer for the per-group std (``grpo`` mode).
+    mode : str
+        ``"grpo"``: rewards normalized to zero mean / unit std within the
+        group (Shao et al., DeepSeekMath).
+        ``"rloo"``: leave-one-out baseline, ``a_i = r_i - mean(r_j, j != i)``
+        (Ahmadian et al., RLOO) -- unbiased, no std division, useful when
+        reward scales are meaningful.
 
     Returns
     -------
     torch.Tensor
         Advantages, same shape as ``rewards``.
     """
+    if mode not in ("grpo", "rloo"):
+        raise ValueError(f"mode = {mode}, must be 'grpo' or 'rloo'")
     if rewards.ndim != 1:
         raise ValueError(f"rewards must be 1D, got shape {tuple(rewards.shape)}")
     if rewards.numel() % group_size != 0:
@@ -98,9 +106,16 @@ def compute_group_advantages(
             f"rewards length {rewards.numel()} not divisible by group_size {group_size}"
         )
     grouped = rewards.view(-1, group_size)
-    mean = grouped.mean(dim=-1, keepdim=True)
-    std = grouped.std(dim=-1, keepdim=True)
-    advantages = (grouped - mean) / (std + eps)
+    if mode == "rloo":
+        if group_size < 2:
+            raise ValueError("rloo mode requires group_size >= 2")
+        total = grouped.sum(dim=-1, keepdim=True)
+        loo_mean = (total - grouped) / (group_size - 1)
+        advantages = grouped - loo_mean
+    else:
+        mean = grouped.mean(dim=-1, keepdim=True)
+        std = grouped.std(dim=-1, keepdim=True)
+        advantages = (grouped - mean) / (std + eps)
     return advantages.reshape(-1)
 
 
@@ -126,6 +141,7 @@ def grpo_step(
     zero_grad: bool = True,
     optimizer_step: bool = True,
     grad_scale: float = 1.0,
+    advantage_mode: str = "grpo",
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -224,7 +240,7 @@ def grpo_step(
 
     # 2. Reward + 3. group-relative advantages.
     rewards = reward_fn(expanded_prompts, completions).to(device)
-    advantages = compute_group_advantages(rewards, group_size)
+    advantages = compute_group_advantages(rewards, group_size, mode=advantage_mode)
 
     # Scoring/gradient passes are fed the sequence without its last token, so
     # next-token prediction aligns each completion token `p` with the logits at
