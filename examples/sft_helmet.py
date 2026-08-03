@@ -116,8 +116,9 @@ def main() -> None:
     for r in train_records:
         p_ids = tokenizer.encode(prompt_style.apply(r["input"]))
         a_ids = tokenizer.encode(" " + targets_of(r)[0], eos=True)
-        full_seqs.append(torch.cat([p_ids, a_ids]))
-        tgt_seqs.append(a_ids)
+        # cross_entropy requires Long targets
+        full_seqs.append(torch.cat([p_ids, a_ids]).long())
+        tgt_seqs.append(a_ids.long())
     lens = [int(s.size(0)) for s in full_seqs]
     max_len = max(lens)
     cache_length = args.cache_length or (max_len + 8)
