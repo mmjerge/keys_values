@@ -85,6 +85,45 @@ dependency; (b) implement their transaction interface with keys_values as the
 retained-state + replay provider -- depends on their code release quality;
 worth a scoping pass once we have (a).
 
+## B1 scoping result (public repo review, MindLab-Research/longstraw)
+
+Verdict from reading `STATUS.md`, `docs/limitations.md`, `ARCHITECTURE.md`:
+
+1. **Adopting the wrapper directly is a non-starter today.** The public tree
+   is explicitly `review_only_not_runnable`: no distributable runtime, model
+   snapshot, or fixtures; the CLI fail-closes before `ray.init` without their
+   deployment "doctor" accepting an immutable pinned image. The
+   implementation is GLM-5.2-specific (78-layer MLA/DSA + MoE), built on
+   Megatron + Ray + a multi-node Tinker sampler, validated on 32x H20. The
+   `integrations/huggingface` surface is a model-snapshot prep script, not a
+   generic trainer API. There is no path by which a litgpt GPT on one A10G
+   "uses LongStraw" as a library.
+2. **The schedule is fully documented and independently validated -- take
+   that.** Their "response-only update" loop (restore resident prefix
+   boundary -> replay decoder + chunked head per response -> token-aligned
+   log-probs -> clipped GRPO objective -> backprop -> restore boundary ->
+   accumulate over G -> one optimizer step) is precisely implementable in
+   keys_values, and their receipts derisk it: **gradient cosine 0.99993 /
+   relative L2 ~0.0117 versus conventional full-sequence gradients at 32K**.
+   That parity number validates the response-only-gradient design our loop
+   already follows, and justifies building the prompt-snapshot/restore
+   optimization (stage (a)) with confidence.
+3. **Their architecture split is a good template.** The surface separation
+   (prefix_state ownership / capture hooks / response_replay adapter /
+   engine-neutral GRPO math / chunked LM head) maps directly onto keys_values
+   components; stage (a) should mirror the `prefix_state` + `response_replay`
+   boundary so a future stage (b) -- if they ever ship a runnable generic
+   backend -- is a thin adapter.
+4. **Side-finding for the PE workstream**: they hit the positional question
+   at 2M and resolved it the same way we propose -- opt-in RoPE scaling
+   (YaRN) for execution, and explicitly "a different position encoding is not
+   required before training"; position quality is treated as the *RL training
+   objective*, with LongRoPE-style changes deferred unless trained
+   checkpoints expose a collapse. This supports our A3 design (train through
+   the sparse layout; measure whether adaptation closes the gap) and frames
+   compaction/PE changes as inference-quality levers, not training
+   prerequisites.
+
 ## The accuracy-gap workstream (mseeger: "needs to be dealt with now")
 
 Our measured sparse-vs-dense gaps (base model): ~1pp EM on single-hop QA
