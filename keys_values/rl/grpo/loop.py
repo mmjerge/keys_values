@@ -43,6 +43,7 @@ import time
 from contextlib import contextmanager
 
 from keys_values.rl.grpo.loss import GRPOLossHeadModel
+from keys_values.rl.grpo.prefix import expand_prefix_to_group
 from keys_values.rl.grpo.rollout import generate_completions_with_logprobs
 from keys_values.kvcache.gradient.main import LongContextGradientModel
 from keys_values.rl.logprobs import compute_logprobs
@@ -126,6 +127,7 @@ def grpo_step(
     zero_grad: bool = True,
     optimizer_step: bool = True,
     grad_scale: float = 1.0,
+    share_prompt_prefill: bool = False,
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -210,6 +212,21 @@ def grpo_step(
         verbose=verbose,
     )
     with _phase_timer(times, "gen_time_ms", device):
+        prefill_logits = None
+        if share_prompt_prefill:
+            # LongStraw-style shared-prompt schedule: prefill the prompt ONCE
+            # at batch 1, then expand the (bounded) retained cache state to the
+            # group batch so decoding stays batched. Requires one prompt per
+            # step and non-quantized cache buffers.
+            if num_prompts != 1:
+                raise ValueError(
+                    "share_prompt_prefill requires a single prompt per step "
+                    f"(got num_prompts={num_prompts})"
+                )
+            with torch.no_grad():
+                logits_1 = inference_model(prompt_ids.to(device), targets=None)
+            expand_prefix_to_group(gpt_model, group_size)
+            prefill_logits = logits_1.expand(group_size, -1, -1)
         completions, gen_logps, mask = generate_completions_with_logprobs(
             model=inference_model,
             prompt_ids=expanded_prompts,
@@ -219,6 +236,7 @@ def grpo_step(
             top_p=top_p,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
+            prefill_logits=prefill_logits,
         )
     completion_len = completions.shape[1]
 
@@ -289,7 +307,9 @@ def grpo_step(
         # Quantify the rollout (decode) vs. training-forward log-prob skew over
         # real completion tokens -- a measure of the train/inference gap.
         with torch.no_grad():
-            skew = ((gen_logps - old_logps).abs() * mask).sum() / mask.sum().clamp_min(1.0)
+            skew = ((gen_logps - old_logps).abs() * mask).sum() / mask.sum().clamp_min(
+                1.0
+            )
         metrics["logp_skew_decode_vs_forward"] = float(skew.item())
     if profile:
         metrics.update(times)

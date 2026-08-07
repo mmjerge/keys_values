@@ -101,7 +101,9 @@ def _sampled_token_logprobs(
         [max(float(sa.get("temperature", 1.0)), 1e-5) for sa in sample_args_list],
         device=logits.device,
         dtype=logits.dtype,
-    ).unsqueeze(-1)  # (batch_size, 1)
+    ).unsqueeze(
+        -1
+    )  # (batch_size, 1)
     logp_all = torch.log_softmax(logits / temps, dim=-1)
     return logp_all.gather(-1, tokens.view(-1, 1)).squeeze(-1)
 
@@ -258,6 +260,7 @@ def batched_generate_fn(
     deallocate_cache_buffers: bool = True,
     return_logprobs: bool = False,
     no_inference_mode: bool = False,
+    prefill_logits: Optional[torch.Tensor] = None,
 ) -> Iterator[torch.Tensor]:
     """Generate tokens for a batch of prompts (see :func:`_batched_generate_impl`).
 
@@ -270,6 +273,12 @@ def batched_generate_fn(
     in place outside inference mode, which breaks the following training
     forward/backward. Eval and generation-only callers keep the default (faster)
     inference mode.
+
+    ``prefill_logits``: if given, the prompt is assumed to be *already
+    prefilled* into the model's KV caches, and this tensor (shape
+    ``(batch_size, 1, vocab)``, the final-position logits of that prefill) is
+    used to sample the first token; the internal prefill is skipped. Used for
+    shared-prompt GRPO groups (see ``keys_values.rl.grpo.prefix``).
     """
     ctx = torch.no_grad() if no_inference_mode else torch.inference_mode()
     with ctx:
@@ -282,6 +291,7 @@ def batched_generate_fn(
             stop_tokens=stop_tokens,
             deallocate_cache_buffers=deallocate_cache_buffers,
             return_logprobs=return_logprobs,
+            prefill_logits=prefill_logits,
         )
 
 
@@ -295,6 +305,7 @@ def _batched_generate_impl(
     stop_tokens: Tuple[List[int], ...] = (),
     deallocate_cache_buffers: bool = True,
     return_logprobs: bool = False,
+    prefill_logits: Optional[torch.Tensor] = None,
 ) -> Iterator[torch.Tensor]:
     """
     Generates tokens for a batch of prompts.
@@ -362,10 +373,19 @@ def _batched_generate_impl(
     # first token below. Chunk size does not matter, just must be nonzero.
     gpt_model = model.gpt_model
     gpt_model.max_seq_length = prompt_len + max_returned_tokens
-    logits_final_position = model(prompts, targets=None)
+    if prefill_logits is None:
+        logits_final_position = model(prompts, targets=None)
+    else:
+        # Prompt already prefilled into the KV caches by the caller (shared-
+        # prompt GRPO groups); use the provided final-position logits.
+        logits_final_position = prefill_logits
     assert logits_final_position.ndim == 3 and logits_final_position.shape[1] == 1, (
         logits_final_position.shape,
     )
+    if prefill_logits is not None and logits_final_position.shape[0] != batch_size:
+        raise ValueError(
+            f"prefill_logits batch {logits_final_position.shape[0]} != prompts batch {batch_size}"
+        )
 
     # If `stop_progresses[b][si] > 0`, the past `k = stop_progresses[b][si]`
     # batch dim `b` tokens are equal to the first `k` entries of
@@ -417,9 +437,9 @@ def _batched_generate_impl(
                     seq_pos = int(seq_pos > 0 and int_token == seq[0])
                 stop_progresses[batch_idx][seq_idx] = seq_pos
 
-        token_out = torch.where(
-            stopped_mask, ignore_ind_vec, tokens.flatten()
-        ).view(-1, 1)
+        token_out = torch.where(stopped_mask, ignore_ind_vec, tokens.flatten()).view(
+            -1, 1
+        )
         if return_logprobs:
             # `stopped_mask` reflects rows that stopped in a *previous* step,
             # so `~stopped_mask` marks the tokens generated at this step (the

@@ -116,6 +116,7 @@ def generate_completions_with_logprobs(
     top_p: float = 1.0,
     eos_token_id: Optional[int] = None,
     pad_token_id: int = 0,
+    prefill_logits: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate completions **and** capture old-policy log-probs in one pass.
 
@@ -173,6 +174,7 @@ def generate_completions_with_logprobs(
         deallocate_cache_buffers=True,
         return_logprobs=True,
         no_inference_mode=True,  # buffers are updated in place by the grad pass
+        prefill_logits=prefill_logits,
     ):
         tok_chunks.append(tokens)
         logp_chunks.append(logps)
