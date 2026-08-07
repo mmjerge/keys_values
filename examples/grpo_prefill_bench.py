@@ -62,8 +62,19 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--disable-flashinfer",
+        action="store_true",
+        help="Force eager SDPA (needed for GQA group sizes FlashInfer rejects, "
+        "e.g. Qwen-0.5B).",
+    )
     parser.add_argument("--access-token", default=None)
     args = parser.parse_args()
+
+    if args.disable_flashinfer:
+        from keys_values.attention import flashinfer_ops
+
+        flashinfer_ops._available = False
 
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
     fabric = L.Fabric(
