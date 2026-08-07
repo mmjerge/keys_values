@@ -146,6 +146,36 @@ trainer = GRPOLongContextTrainer(
 trainer.train()
 ```
 
+## Shared-prompt prefill
+
+Every member of a GRPO group shares the same prompt, but the naive rollout
+prefills it `group_size` times. With `share_prompt_prefill=True`, `grpo_step`
+prefills the prompt once at batch size 1, expands the retained cache state
+(KV buffers, token positions, score accumulators) to the group batch, and
+keeps the decode batched. This follows the response-only-update schedule
+validated by LongStraw (arXiv:2607.14952). Because KeysAndValues caches are
+bounded, the retained state is small, so the expansion is a cheap row-0
+broadcast.
+
+Constraints: one prompt per step (`prompt_ids.shape[0] == 1`) and caches on
+non-quantized `-default` buffers. Completions are exactly identical to the
+naive schedule (token-level parity is enforced in
+`test/rl/grpo/test_prefix.py` for dense, H2O, and lastrec caches).
+
+Measured on A10G (Qwen2.5-0.5B-Instruct, bf16, eager SDPA, 7000-token prompt,
+`group_size=8`, 128 new tokens, mean of 3 steps):
+
+| cache                | gen baseline | gen shared | gen speedup | total/step |
+|----------------------|-------------:|-----------:|------------:|-----------:|
+| `h2o-default@4096`   |      9.8 s   |     6.4 s  |   1.53x     | 40.3 → 36.9 s |
+| `dense-default@7200` |      9.4 s   |     8.1 s  |   1.16x     | 18.0 → 16.7 s |
+
+The saving is `(G-1)/G` of the prefill cost; the remaining generation time is
+the (serial) decode, so the speedup grows with prompt length and group size
+and shrinks with `max_new_tokens`. Peak memory is unchanged (buffers are
+sized for the group batch either way). Reproduce with
+`examples/grpo_prefill_bench.py`.
+
 ## Tests
 
 ```bash
