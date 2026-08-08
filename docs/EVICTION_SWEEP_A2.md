@@ -67,6 +67,26 @@ training (the RL loop), the flat-frontier region still applies and the
 training-side results (PR #142 docs) show RL through the evicting cache is
 unharmed; the gap is an *inference-time* effect.
 
+**Verification controls** (run after skepticism about the 8192 result;
+`runs/a2_controls_*.json`). At 8192 slots, 0/100 trivia and 1/100 nq prompts
+exceed the cache, so eviction is (near-)inactive there:
+
+| arm (8192 slots)   | trivia EM | trivia F1 | nq EM | nq F1 |
+|--------------------|----------:|----------:|------:|------:|
+| dense bf16         |     0.620 |     0.283 | 0.250 | 0.144 |
+| h2o unquantized    |     0.620 |     0.283 | 0.250 | 0.144 |
+| dense quantized-8  |     0.640 |     0.288 | 0.260 | 0.148 |
+| h2o quantized-8    |     0.640 |     0.288 | 0.260 | 0.148 |
+
+Unquantized H2O at 8192 reproduces dense bf16 *exactly*, confirming that
+with no eviction the H2O cache is literally dense attention. Quantized
+dense reproduces quantized H2O *exactly*, confirming the +2pp over bf16 is
+the 8-bit rounding perturbing greedy decoding -- a noise-level numeric
+effect that happened to land positive here, not a gain from H2O and not a
+systematic gain from quantization. The clean decomposition:
+**retention determines accuracy; 8-bit quantization is a ~±2pp numeric
+perturbation; H2O scoring only matters when eviction is active.**
+
 **Caveats.** Single seed, n=100, one model (0.5B), one context length (8k).
-Differences <= 2pp are within noise; the ordering dense > h2o > lastrec is
-stable across both datasets and metrics.
+Differences <= 2pp are within noise; the ordering dense > h2o > lastrec
+(under active eviction) is stable across both datasets and metrics.
