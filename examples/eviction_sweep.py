@@ -67,6 +67,7 @@ def sweep_arms(cache_length: int, dense_length: int):
     g16 = cache_length // 16
     return [
         ("dense", "dense-default", dense_length, {}),
+        ("dense_q8", "dense-torch-quantized8", dense_length, {}),
         ("h2o_q8", "h2o-torch-quantized8", cache_length, {"grace_period": g16}),
         ("h2o_fp", "h2o-default", cache_length, {"grace_period": g16}),
         (
