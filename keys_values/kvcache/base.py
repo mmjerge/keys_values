@@ -445,6 +445,12 @@ class DefaultKVCache(KVCache):
             self.mha = mha
         self._device = None  # Unassigned so far
         self._input_pos = 0
+        # If set (see `keys_values.kvcache.pos_compact.set_position_compaction`),
+        # queries and cached keys are re-expressed at compacted (rank) RoPE
+        # positions before attention, removing the "holey" position layout
+        # left behind by eviction. No effect for exact (dense) caches, where
+        # rank == original position.
+        self.compact_positions = False
 
     @property
     def input_pos(self) -> int:
@@ -580,6 +586,18 @@ class DefaultKVCache(KVCache):
         # Multi-head self-attention main computation
         return_attn_weights = (not for_prefill) and self.update_requires_attn_weights()
         token_positions = None if for_prefill else self.token_positions()
+        if self.compact_positions and not for_prefill:
+            from keys_values.kvcache.pos_compact import compact_rope_positions
+
+            query, k_and_v = compact_rope_positions(
+                query=query,
+                k_and_v=k_and_v,
+                token_positions=token_positions,
+                input_pos=input_pos,
+                num=num,
+                pos_encoding=self.mha.pos_encoding,
+                rope_n_elem=self.config.rope_n_elem,
+            )
         attn_outputs, attn_weights = self.mha(
             query=query,
             k_and_v=k_and_v,
