@@ -17,3 +17,9 @@ out/
 checkpoints/
 test_tokenizer/
 keyval_venv/
+
+# Terraform (state may contain sensitive values; lock file IS committed)
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
