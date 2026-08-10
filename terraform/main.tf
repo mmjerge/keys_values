@@ -160,7 +160,22 @@ resource "aws_iam_instance_profile" "worker" {
   role = aws_iam_role.worker.name
 }
 
-# --- Workers -------------------------------------------------------------------
+# --- Workers: ASG with mixed instances across every AZ --------------------------
+#
+# Single-GPU capacity is scarce and shifts hour to hour. Instead of pinning a
+# type + AZ (and manually retrying on InsufficientInstanceCapacity), the
+# autoscaling group is given every default-VPC subnet and a prioritized list
+# of instance types; EC2 then searches the whole (type x AZ) grid and
+# backfills toward desired_capacity automatically as capacity frees up.
+# Workers have no stable identity: at boot they provision themselves and pull
+# jobs from the S3 queue, so it does not matter where a worker lands.
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
 
 locals {
   user_data = <<-EOT
@@ -176,22 +191,75 @@ locals {
   EOT
 }
 
-resource "aws_instance" "worker" {
-  count                  = var.worker_count
-  ami                    = data.aws_ami.dl_base.id
-  instance_type          = var.instance_type
-  key_name               = aws_key_pair.worker.key_name
-  vpc_security_group_ids = [aws_security_group.ssh.id]
-  iam_instance_profile   = aws_iam_instance_profile.worker.name
-  user_data              = local.user_data
+resource "aws_launch_template" "worker" {
+  name_prefix = "kv-worker-"
+  image_id    = data.aws_ami.dl_base.id
+  key_name    = aws_key_pair.worker.key_name
+  user_data   = base64encode(local.user_data)
 
-  root_block_device {
-    volume_size = var.root_volume_gb
-    volume_type = "gp3"
+  iam_instance_profile {
+    name = aws_iam_instance_profile.worker.name
   }
 
-  tags = {
-    Name      = "kv-rl-worker-${count.index}"
-    kv-worker = "true"
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.ssh.id]
   }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_size = var.root_volume_gb
+      volume_type = "gp3"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name      = "kv-rl-worker"
+      kv-worker = "true"
+    }
+  }
+}
+
+resource "aws_autoscaling_group" "workers" {
+  name                = "kv-rl-workers"
+  desired_capacity    = var.worker_count
+  min_size            = 0
+  max_size            = var.worker_count
+  vpc_zone_identifier = data.aws_subnets.default.ids
+
+  # Keep trying: re-attempt placement instead of giving up on capacity errors.
+  capacity_rebalance = false
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_percentage_above_base_capacity = var.use_spot ? 0 : 100
+      on_demand_allocation_strategy            = "prioritized"
+      spot_allocation_strategy                 = "capacity-optimized"
+    }
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.worker.id
+        version            = "$Latest"
+      }
+      dynamic "override" {
+        for_each = var.instance_types
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+  }
+
+  tag {
+    key                 = "kv-worker"
+    value               = "true"
+    propagate_at_launch = true
+  }
+
+  # Self-stopped workers (queue drained) should not be replaced into an empty
+  # queue; scale desired_capacity back up when submitting new jobs.
+  suspended_processes = ["ReplaceUnhealthy"]
 }

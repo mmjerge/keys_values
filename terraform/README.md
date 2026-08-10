@@ -6,10 +6,15 @@ the training code has no dependency on it.
 
 What it deploys (all in your own AWS account):
 
-- **N single-GPU workers** (default `g6e.2xlarge`, L40S 48GB) from the AWS
-  Deep Learning Base AMI, provisioned at boot by
+- **An autoscaling group of single-GPU workers** (L40S 48GB types by
+  default) from the AWS Deep Learning Base AMI, provisioned at boot by
   `scripts/provision_worker.sh` (repo, pinned Python stack, canonical HELMET
-  splits from S3, model checkpoint, smoke test).
+  splits from S3, model checkpoint). The ASG spans **every AZ** and a
+  **prioritized list of instance types**, so EC2 searches the whole
+  (type x AZ) grid and backfills toward `worker_count` automatically as
+  capacity appears -- no manual retrying on InsufficientInstanceCapacity.
+  Workers are cattle: at boot they start `scripts/worker_loop.sh`, pull jobs
+  from the S3 queue, and stop themselves when the queue drains.
 - **IAM role** for the workers: read the canonical-splits bucket, read/write
   the results bucket, and stop *worker-tagged* instances only (for the
   self-stop-when-queue-empty behavior of `scripts/worker_loop.sh`).
@@ -46,13 +51,20 @@ Interesting variables (see `variables.tf` for all):
 
 | variable | default | notes |
 |---|---|---|
-| `worker_count` | 1 | 0 = shared infra only |
-| `instance_type` | `g6e.2xlarge` | L40S 48GB; `g5.2xlarge` (A10G 24GB) is the budget option |
+| `worker_count` | 1 | ASG desired capacity; 0 = shared infra only |
+| `instance_types` | `[g6e.2xlarge, g6e.4xlarge, g6e.8xlarge]` | priority order; all L40S 48GB. ASG falls back across types and AZs automatically |
+| `use_spot` | `false` | spot = ~60-70% cheaper but interruptible; enable once jobs checkpoint/resume |
 | `repo_branch` | `experiments` | what the workers check out |
 | `model` | `Qwen/Qwen2.5-7B-Instruct` | downloaded at provision time |
-| `start_worker_loop` | `false` | `true` = boot, drain the S3 job queue, self-stop |
+| `start_worker_loop` | `true` | boot, drain the S3 job queue, self-stop |
 | `results_bucket` | `keys-values-rl-results` | bucket names are global -- override for your own deployment |
 | `create_results_bucket` | `true` | `false` to attach to an existing bucket |
+
+Scaling with the queue: `terraform apply -var worker_count=N` when you
+submit N jobs; workers self-stop as the queue drains (a self-stopped
+instance still counts against the ASG until terminated -- scale
+`worker_count` back down, or terminate stopped workers, when a campaign
+ends).
 
 ## Job queue
 

@@ -24,10 +24,16 @@ variable "worker_count" {
   default     = 1
 }
 
-variable "instance_type" {
-  description = "Worker instance type. Single-GPU types (g6e.2xlarge = L40S 48GB, g5.2xlarge = A10G 24GB) have far better availability than 8-GPU nodes; the RL jobs are independent single-GPU workers, so a fleet of small instances is equivalent."
-  type        = string
-  default     = "g6e.2xlarge"
+variable "instance_types" {
+  description = "Worker instance types in priority order. The autoscaling group tries every (type x AZ) combination and backfills automatically as capacity appears, so list every type whose per-GPU memory fits your job (all L40S 48GB here; 7B GRPO needs ~36GB). Larger sizes cost more but often have capacity when the small one is dry."
+  type        = list(string)
+  default     = ["g6e.2xlarge", "g6e.4xlarge", "g6e.8xlarge"]
+}
+
+variable "use_spot" {
+  description = "Use spot capacity (capacity-optimized allocation, ~60-70% cheaper, but instances can be interrupted mid-run -- only sensible once jobs checkpoint/resume). Default on-demand."
+  type        = bool
+  default     = false
 }
 
 variable "root_volume_gb" {
@@ -90,7 +96,7 @@ variable "model" {
 }
 
 variable "start_worker_loop" {
-  description = "Start the S3 job-queue worker loop at boot (with self-stop when the queue drains). If false, instances just provision and wait for SSH."
+  description = "Start the S3 job-queue worker loop at boot. Default true: ASG workers have no stable identity, so pulling jobs from the queue is how they receive work (set false only for interactive/debug fleets you plan to SSH into)."
   type        = bool
-  default     = false
+  default     = true
 }

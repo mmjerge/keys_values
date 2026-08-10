@@ -12,30 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-output "worker_public_ips" {
-  description = "Public IPs of the worker instances."
-  value       = aws_instance.worker[*].public_ip
-}
-
-output "worker_instance_ids" {
-  value = aws_instance.worker[*].id
+output "autoscaling_group" {
+  description = "ASG name. List current workers with: aws ec2 describe-instances --filters Name=tag:kv-worker,Values=true Name=instance-state-name,Values=running"
+  value       = aws_autoscaling_group.workers.name
 }
 
 output "ami_used" {
   value = data.aws_ami.dl_base.name
-}
-
-output "ssh_config_snippet" {
-  description = "Paste into ~/.ssh/config (adjust IdentityFile)."
-  value = join("\n", [
-    for i, ip in aws_instance.worker[*].public_ip : <<-EOT
-      Host rl-${i}
-          HostName ${ip}
-          User ubuntu
-          IdentityFile ~/.ssh/kv-worker.pem
-          StrictHostKeyChecking accept-new
-    EOT
-  ])
 }
 
 output "results_bucket_uri" {
