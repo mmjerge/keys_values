@@ -88,6 +88,40 @@ probes (capability > 0 but low; verifiable reward; not style-gameable):
 json_kv remains capability-null for the base models (0.00) and stays
 excluded (cold-start gate).
 
+## Positioning vs related work
+
+**LongStraw** (arXiv:2607.14952, the RL harness Konstantinos flagged) and
+**OOMB** (openreview dSa3ImCQr7): assessed in
+`docs/LONGSTRAW_OOMB_ASSESSMENT.md` (branch `longstraw-assessment`).
+Summary: the public LongStraw tree is review-only and GLM/Megatron/Ray-
+specific, so the wrapper is not adoptable -- but its *schedule* is, and its
+gradient-parity receipts validate it. We implemented the response-only-
+update idea as shared-prompt prefill (`prompt-reuse`: prefill the shared
+prompt once, expand the retained cache state per group member, token-exact,
+1.5x generation speedup). The structural contrast with OOMB frames our
+whole effort: OOMB *keeps the full KV and hides the cost* (paging, CPU
+offload, O(1) activations via chunk recurrence); we *bound the state and
+pay in accuracy* (eviction) -- which is why the accuracy-gap workstream
+exists, and why our bounded retained state composes better with
+LongStraw-style group reuse at extreme context (per-member restore is
+O(cache_length), not O(context)).
+
+**Spherical KV** (arXiv:2605.18856): angle-domain key storage +
+rate-distortion retention (joint keep/drop + precision-tier decisions
+under a byte budget). Our A2 decomposition -- retention determines
+accuracy, 8-bit quantization is accuracy-free, so spend bytes on more
+retained tokens -- is an independent confirmation of their rate-distortion
+framing from the training side. Their retention policy is the natural
+next candidate for the A2 sweep, and the angle-domain representation
+connects to the spherical-embedding direction (A4).
+
+**Needle-in-a-haystack / RULER**: the standard instruments for measuring
+exactly what eviction destroys (retrieval of planted facts vs depth and
+distractor count). RULER's multi-key variants give a difficulty dial and
+fully verifiable rewards; ranked as hard-task candidate 3 above, and
+independently useful as a diagnostic axis for the flagship (eviction loss
+as a function of needle depth at fixed cache budget).
+
 ## Where the work lives (branches / PRs)
 
 Upstream (awslabs/keys_values):

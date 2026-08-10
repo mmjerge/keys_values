@@ -88,6 +88,20 @@ memory** -- the only configuration that runs in this regime.
 - Canonical data + run artifacts on S3, collaborator read access granted
 - Validated 7B/48GB recipe encoded in one job-generator script
 
+# Positioning vs related work
+
+- **LongStraw** (2607.14952): wrapper not adoptable (review-only,
+  GLM/Megatron-specific) -- but we adopted its validated *schedule* as
+  shared-prompt prefill (token-exact, 1.5x gen speedup)
+- **OOMB**: keeps full KV, hides the cost (paging/offload). We *bound*
+  the state and pay in accuracy -- hence the accuracy-gap workstream;
+  bounded state composes better with group reuse at extreme context
+- **Spherical KV** (2605.18856): rate-distortion retention -- our A2
+  finding (retention determines accuracy; quantization is free) confirms
+  the framing independently; their policy = next A2 candidate
+- **Needle-in-a-haystack / RULER**: the diagnostic for what eviction
+  destroys; difficulty dial + verifiable rewards
+
 # Next: a genuinely hard task
 
 1. **LongProc** -- long procedural generation; outputs 2-8k tokens,
