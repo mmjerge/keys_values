@@ -34,7 +34,9 @@ pip install -q \
     lightning==2.6.5 \
     transformers==4.57.6 \
     datasets==3.0.2 \
-    numpy==2.5.1
+    numpy==2.5.1 \
+    scipy==1.18.0 \
+    pandas==3.0.5
 pip install -q -e .
 pip install -q awscli
 
