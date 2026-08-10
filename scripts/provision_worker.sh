@@ -26,7 +26,16 @@ if [ ! -d "$HOME/venv" ]; then
 fi
 source "$HOME/venv/bin/activate"
 pip install -q --upgrade pip
-pip install -q -e ".[all]" 2>/dev/null || pip install -q -e .
+# The package's own install_requires is minimal; the runtime stack is pinned
+# here (versions mirrored from the known-good grpo-bench worker).
+pip install -q \
+    torch==2.13.0 \
+    litgpt==0.5.13 \
+    lightning==2.6.5 \
+    transformers==4.57.6 \
+    datasets==3.0.2 \
+    numpy==2.5.1
+pip install -q -e .
 pip install -q awscli
 
 echo "=== [3/5] canonical HELMET splits from S3 ==="
