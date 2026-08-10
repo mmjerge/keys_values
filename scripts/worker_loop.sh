@@ -47,7 +47,15 @@ while true; do
     echo "exit=$STATUS" >> "$OUT/job.log"
 
     aws s3 sync "$OUT" "$BUCKET/runs/$NAME/" --region $REGION --only-show-errors
-    echo "$NAME done (exit=$STATUS), results at $BUCKET/runs/$NAME/"
+    if [ $STATUS -ne 0 ]; then
+        # Park failed jobs visibly instead of silently draining the queue;
+        # requeue after diagnosis with: aws s3 mv .../failed/X.sh .../pending/X.sh
+        aws s3 mv "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
+            "$BUCKET/queue/failed/${JOB}" --region $REGION --only-show-errors
+        echo "$NAME FAILED (exit=$STATUS), parked in queue/failed/, log at $BUCKET/runs/$NAME/job.log"
+    else
+        echo "$NAME done, results at $BUCKET/runs/$NAME/"
+    fi
 done
 
 if [ "${KV_STOP_WHEN_DONE:-0}" = "1" ]; then
