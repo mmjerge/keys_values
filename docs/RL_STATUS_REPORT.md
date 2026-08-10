@@ -87,3 +87,36 @@ probes (capability > 0 but low; verifiable reward; not style-gameable):
 
 json_kv remains capability-null for the base models (0.00) and stays
 excluded (cold-start gate).
+
+## Where the work lives (branches / PRs)
+
+Upstream (awslabs/keys_values):
+
+- **PR #142** -- the RL core (GRPO loop, cache reuse, HELMET drivers,
+  results docs). Review comments addressed; awaiting merge.
+- **PR #145** -- HELMET loader seed fix. Merged.
+- #133 (vLLM) and #144 (eviction defaults) closed as discussed.
+
+Staged on the fork (stacked on `experiments`/`grpo-upstream`, to be
+rebased onto `main` and re-targeted upstream once #142 lands):
+
+- **mmjerge#4** -- A1/A2 sparse-accuracy analysis: position compaction
+  (negative), eviction-policy sweep, quantization controls, budget
+  frontier.
+- **mmjerge#5** -- optional Terraform module for the worker fleet
+  (autoscaling across all AZs/instance types, S3 job queue,
+  self-provisioning workers, collaborator read grants).
+- **mmjerge#6** -- LongProc RL driver (`examples/grpo_longproc.py`):
+  long procedural generation with rule-checkable outputs as verifiable
+  rewards; includes `--eval-only` capability probing. Base-7B probes for
+  LongProc + infinite_bench_qa/narrative_qa are queued behind the
+  flagship runs.
+
+Feature branches pending as follow-up PRs after #142: `rl-rloo`,
+`sft-helmet`, `prompt-reuse` (shared-prompt prefill, token-exact, 1.5x
+generation speedup).
+
+Shared artifacts: canonical HELMET splits (8k campaign draw + seeded 32k)
+at `s3://keys-values-helmet-canonical` (your account has read access) and
+the `helmet-splits-v1` GitHub release; run artifacts land in
+`s3://keys-values-rl-results` (read access granted as well).
