@@ -142,6 +142,10 @@ def main() -> None:
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--steps", type=int, default=150)
     p.add_argument("--lr", type=float, default=1e-6)
+    p.add_argument("--optimizer", choices=["adamw", "paged_adamw8bit"],
+                   default="adamw",
+                   help="paged_adamw8bit keeps optimizer states in CPU-paged "
+                        "memory (needed for 7B+ full fine-tuning on 48GB).")
     p.add_argument("--chunk-size", type=int, default=1024)
     p.add_argument("--layers-per-cell", type=int, default=1)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -212,7 +216,14 @@ def main() -> None:
     gpt_model.assign_kv_caches(KVCacheFactory.create(
         gpt_model=gpt_model, name=args.kv_cache_name, max_batch_size=args.group_size,
         cache_length=cache_length, dtype=dtype, cache_kwargs=cache_kwargs))
-    optimizer = torch.optim.AdamW(gpt_model.parameters(), lr=args.lr)
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(gpt_model.parameters(), lr=args.lr)
+    else:
+        # Paged 8-bit AdamW: optimizer states live in CPU-paged memory instead
+        # of ~4x model-size on the GPU. Required for 7B+ full fine-tuning on a
+        # 48GB card (bf16 AdamW states alone are ~30GB for 7B).
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.PagedAdamW8bit(gpt_model.parameters(), lr=args.lr)
 
     def reward_fn(prompt_ids: torch.Tensor, completion_ids: torch.Tensor) -> torch.Tensor:
         rec = reward_fn.current_record

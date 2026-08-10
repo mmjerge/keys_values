@@ -84,3 +84,4 @@ typing_extensions==4.16.0
 urllib3==2.7.0
 xxhash==3.8.1
 yarl==1.24.5
+bitsandbytes==0.49.1
