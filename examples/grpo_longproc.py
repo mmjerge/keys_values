@@ -102,6 +102,28 @@ def primary_score(eval_fn, metric: str, prediction: str, record: dict) -> float:
         return 0.0
 
 
+def shaped_score(eval_fn, metric: str, prediction: str, record: dict,
+                 format_bonus: float) -> float:
+    """Training reward: primary metric plus a small format bonus.
+
+    Sampled rollouts at temperature 1.0 almost never hit the strict output
+    format the checkers require (e.g. a ```tsv fenced block), so the primary
+    metric is 0.0 for every group member and RLOO gets no gradient (observed:
+    30+ steps of all-zero rewards while greedy eval scores 0.157). The
+    evaluators expose format adherence (``extraction_rate`` etc.); paying a
+    small bonus for parseable output gives the group a reward *spread* to
+    climb out of the cold start. Eval always uses the unshaped primary
+    metric.
+    """
+    try:
+        metrics, _ = eval_fn(prediction, record["item"])
+        primary = float(metrics.get(metric, 0.0))
+        fmt = float(metrics.get("extraction_rate", 0.0))
+        return primary + format_bonus * fmt
+    except Exception:
+        return 0.0
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
@@ -121,7 +143,12 @@ def main() -> None:
                    default="paged_adamw8bit")
     p.add_argument("--chunk-size", type=int, default=1024)
     p.add_argument("--layers-per-cell", type=int, default=1)
-    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--temperature", type=float, default=0.7,
+                   help="Rollout sampling temperature. Long structured outputs "
+                        "derail badly at 1.0 (zero parseable rollouts observed).")
+    p.add_argument("--format-bonus", type=float, default=0.2,
+                   help="Training-reward bonus per unit of format adherence "
+                        "(extraction_rate); 0 disables shaping.")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--n-eval", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
@@ -231,7 +258,8 @@ def main() -> None:
                 vals = []
                 for row in completion_ids:
                     text = tokenizer.decode(row[row != pad_id])
-                    vals.append(primary_score(eval_fn, metric, text, rec))
+                    vals.append(shaped_score(eval_fn, metric, text, rec,
+                                             args.format_bonus))
                 return torch.tensor(vals, dtype=torch.float32)
 
             micro_metrics.append(grpo_step(
