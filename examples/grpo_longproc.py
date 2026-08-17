@@ -69,14 +69,16 @@ from keys_values.rl.grpo.rollout import generate_completions
 from keys_values.utils import VerbosityLevels
 
 # Primary metric per task family: the scalar the evaluator returns that we
-# use as the reward (and eval score).
+# use as the reward (and eval score). Verified against each evaluator's
+# actual output on reference completions (countdown/travel_planning return
+# "accuracy", not "success").
 PRIMARY_METRIC = {
     "html_to_tsv": "f1",
     "pseudo_to_code": "accuracy",
     "path_traversal": "accuracy",
     "tom_tracking": "accuracy",
-    "countdown": "success",
-    "travel_planning": "success",
+    "countdown": "accuracy",
+    "travel_planning": "accuracy",
 }
 
 
@@ -94,7 +96,7 @@ def load_longproc(dataset: str, path: Path):
 
 def primary_score(eval_fn, metric: str, prediction: str, record: dict) -> float:
     try:
-        metrics, _ = eval_fn(prediction, record["item"])
+        metrics, _ = eval_fn(prediction, record)
         return float(metrics.get(metric, 0.0))
     except Exception:
         # Evaluators are robust to garbage, but belt-and-braces: a crash in
@@ -116,7 +118,7 @@ def shaped_score(eval_fn, metric: str, prediction: str, record: dict,
     metric.
     """
     try:
-        metrics, _ = eval_fn(prediction, record["item"])
+        metrics, _ = eval_fn(prediction, record)
         primary = float(metrics.get(metric, 0.0))
         fmt = float(metrics.get("extraction_rate", 0.0))
         return primary + format_bonus * fmt
