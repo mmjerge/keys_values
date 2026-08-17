@@ -71,14 +71,32 @@ memory** -- the only configuration that runs in this regime.
 - Canonical splits now on S3 + GitHub release with SHA-256 manifests
 - Related HELMET upstream nondeterminism: issue filed (#43), fix ready
 
-# In flight: 7B @32k flagship
+# Flagship result: 7B @32k, 3 seeds
 
-- Base probes (n=50): nq **0.80 dense / 0.52 through-cache**;
-  hotpot 0.40 / 0.24 -- a 16-28pp eviction gap to close
-- 4 RLOO runs (nq, hotpot x 2 seeds) on a 3-worker L40S fleet, ~350s/step,
-  ETA ~2 days
-- Dense **training** cannot run here at all -- every gain is a
-  "sparse-only regime" gain
+Through-cache EM (deployment condition), dense training **OOMs** here:
+
+| task | base | trained (s0/s1/s2) |
+|---|---:|---|
+| nq | 0.52 | 0.68 / 0.56 / 0.58 |
+| hotpot_qa | 0.24 | 0.36 / 0.38 / 0.36 |
+
+- **6/6 arms positive**; ~half the eviction penalty recovered
+- Eviction gap shrinks: nq 28pp -> 12-20pp; hotpot 16pp -> 6-14pp
+- **Not** a "sparse beats dense" claim -- dense inference still wins on
+  every checkpoint
+- nq dense-eval mixed across seeds: answer-style vs substring-EM artifact
+  (inspected, documented, not quoted)
+
+# In flight: LongProc (the hard task)
+
+- Gate passed: html_to_tsv base F1 **0.157**; travel_planning 0.000
+  (excluded, like json_kv)
+- 2 RLOO seeds training; seed 0 past step 100 at reward ~0.62 vs 0.157 base
+- **Cold start found + fixed**: at temp 1.0 no rollout hit the strict
+  output format -> all-zero rewards, no gradient. Added format-adherence
+  bonus to the training reward (eval unshaped), temp 0.7
+- **Real bug surfaced** (issue #148): chunked backward breaks when a
+  *generated* region spans 3+ chunks; invisible to 32-token QA runs
 
 # Infrastructure (optional, checked in)
 
@@ -102,16 +120,17 @@ memory** -- the only configuration that runs in this regime.
 - **Needle-in-a-haystack / RULER**: the diagnostic for what eviction
   destroys; difficulty dial + verifiable rewards
 
-# Next: a genuinely hard task
+# Next
 
-1. **LongProc** -- long procedural generation; outputs 2-8k tokens,
-   rule-checkable (verifiable rewards, no style gaming); long *decode*
-   stresses eviction during generation. RL driver ready (mmjerge#6);
-   base-7B probes queued.
-2. infinite_bench_qa / narrative_qa at 64k+ (probes running)
-3. RULER needle variants (tunable difficulty; synthetic)
-
-Gate: base capability low but nonzero (json_kv's 0.00 stays excluded).
+- LongProc final evals (~1 day) -> first hard-task result
+- Probe infinite_bench_qa / narrative_qa at **64k+** (we train at 65k;
+  needs a 48GB worker)
+- RULER needle variants: difficulty dial + diagnostic (accuracy vs needle
+  depth at fixed cache budget)
+- Fix #148 properly (or upstream fix) so long generations don't need
+  `chunk_size >= max_new_tokens`
+- Style-robust reward (normalize articles/prepositions) to kill the nq
+  substring-EM artifact at the source
 
 # Asks
 

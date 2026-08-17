@@ -58,35 +58,83 @@ manifests over the record IDs. Upstream HELMET has a related (smaller)
 demo-sampling nondeterminism; issue filed (princeton-nlp/HELMET#43) with
 a fix ready.
 
-## In flight: 7B @32k flagship (first "dense can't do this" gains attempt)
+## Done: 7B @32k flagship -- gains where dense training cannot run
 
-Base-model probes (n=50): nq 0.80 dense-eval / 0.52 through-cache;
-hotpot 0.40 / 0.24 -- a 16-28pp eviction gap for training to close, on a
-model/context where dense TRAINING cannot run. Four RLOO runs (nq, hotpot
-x 2 seeds; em_f1 reward; q8@8192 cache; 200 steps) are running on a
-3-worker L40S fleet, ~350s/step, ETA ~2 days. Infra: S3 job queue +
-self-provisioning workers + optional Terraform module (`terraform/`,
-autoscaling across all AZs/types -- single-GPU capacity is scarce and
-manual placement was costing hours).
+Full detail in `docs/FLAGSHIP_32K_RESULTS.md`. Qwen2.5-7B, HELMET @32k,
+RLOO + em_f1, `h2o-torch-quantized8@8192` (~25-30% prompt retention), 200
+steps, **3 seeds per task**. Dense GRPO OOMs at 24k on the same 48GB card,
+so every run trains in a regime full attention cannot enter.
 
-## Open question: what counts as a genuinely hard task
+Through-cache eval (the deployment condition), EM vs base:
 
-nq at 32k is real long-context RL but the base model is already strong
-(0.80 dense). Candidates for a harder flagship, to be gated by base-model
-probes (capability > 0 but low; verifiable reward; not style-gameable):
+| task | base | trained (s0 / s1 / s2) |
+|---|---:|---|
+| nq | 0.52 | 0.68 / 0.56 / 0.58 |
+| hotpot_qa | 0.24 | 0.36 / 0.38 / 0.36 |
 
-1. **LongProc** (long procedural generation, HELMET add-on): models score
-   low, outputs are 2-8k tokens and rule-checkable, and long *decode*
-   stresses eviction differently than long prefill. Strongest candidate.
-2. **infinite_bench_qa / narrative_qa at 64k+**: harder contexts, existing
-   loaders; 64k+ is deep in the dense-impossible regime.
-3. **RULER multi-key needle variants**: difficulty is a dial (keys,
-   depth), fully verifiable, and directly measures what eviction destroys.
-4. **ALCE citation generation**: verifiable citation grounding; hard, but
-   reward engineering is heavier.
+**6/6 arms positive**, recovering roughly half the eviction penalty; the
+dense-vs-cached gap on the same checkpoint shrinks (nq 28pp -> 12-20pp;
+hotpot 16pp -> 6-14pp). Explicitly NOT claimed: sparse beating dense --
+dense inference still wins on every checkpoint, as A1/A2 predicts. The nq
+*dense-eval* column is mixed across seeds (+8/-12/-16) and is treated as
+metric-artifact territory: generation inspection shows training compresses
+verbose scaffolding to terse spans, which collides with nq's substring-EM
+(targets like "in Super Bowl LII"). Caveats: n=50 (SE ~7pp), one cache
+config, 200 steps.
 
-json_kv remains capability-null for the base models (0.00) and stays
-excluded (cold-start gate).
+Infra used: S3 job queue + self-provisioning workers + optional Terraform
+module (`terraform/`, autoscaling across all AZs/types -- single-GPU
+capacity is scarce and manual placement was costing hours).
+
+## In flight: LongProc (the genuinely hard task)
+
+html_to_tsv_2k passed the capability gate (base 7B greedy F1 0.157
+through-cache; travel_planning scored 0.000 and is excluded like json_kv).
+Two RLOO seeds are training now on `examples/grpo_longproc.py`
+(rule-checkable row-F1 as the reward, 2600-token generations). Seed 0 is
+past step 100 with training reward ~0.62 (vs 0.157 base) -- i.e. learning,
+final evals pending.
+
+Two findings from this regime, both new relative to the QA campaigns:
+
+1. **Reward cold start.** At temperature 1.0 no sampled rollout satisfied
+   the checker's strict output format, so every group member scored 0.0
+   and RLOO had no gradient (30+ dead steps while greedy eval scored
+   0.157). Fixed by adding a small format-adherence bonus
+   (`extraction_rate`) to the *training* reward and lowering rollout
+   temperature to 0.7; eval stays unshaped.
+2. **A real bug in the chunked backward** (issue #148): the replay unpack
+   in `autograd_hooks.py` assumes the final buffer for a node is at most
+   one chunk ahead of the annotation being unpacked; with long *generated*
+   regions spanning 3+ backward chunks it can be two ahead, and backward
+   dies (`final chunk_idx = 3, must be in [1, 2]`). Sampling-dependent, so
+   it looks like flaky infra. Never triggered by our 32-token-completion QA
+   runs. Workaround in use: `chunk_size >= max_new_tokens`.
+
+## Hard-task selection: status
+
+Gate for a candidate: base capability low but nonzero, verifiable reward,
+not style-gameable. Probe results so far (base 7B, through-cache):
+
+| candidate | base score | verdict |
+|---|---:|---|
+| LongProc html_to_tsv_2k | F1 0.157 | **selected**, training now |
+| LongProc travel_planning_2k | 0.000 | excluded (capability-null) |
+| json_kv | 0.000 | excluded (capability-null) |
+| nq @32k | EM 0.52 | usable but base is strong (0.80 dense) |
+| hotpot_qa @32k | EM 0.24 | usable, harder than nq |
+
+Remaining candidates, unprobed:
+
+1. **infinite_bench_qa / narrative_qa at 64k+**: deep in the
+   dense-impossible regime (we train at 65k); probes need a 48GB worker
+   (the A10G OOMs at 32k dense eval).
+2. **RULER multi-key needle variants**: difficulty is a dial (keys,
+   depth), fully verifiable, and directly measures what eviction destroys
+   -- also useful as a diagnostic axis (accuracy vs needle depth at fixed
+   cache budget).
+3. **ALCE citation generation**: verifiable grounding, heavier reward
+   engineering.
 
 ## Positioning vs related work
 
@@ -129,6 +177,8 @@ Upstream (awslabs/keys_values):
 - **PR #142** -- the RL core (GRPO loop, cache reuse, HELMET drivers,
   results docs). Review comments addressed; awaiting merge.
 - **PR #145** -- HELMET loader seed fix. Merged.
+- **Issue #148** -- chunked backward fails when a generated region spans
+  3+ chunks (found by the LongProc runs; workaround documented).
 - #133 (vLLM) and #144 (eviction defaults) closed as discussed.
 
 Staged on the fork (stacked on `experiments`/`grpo-upstream`, to be
