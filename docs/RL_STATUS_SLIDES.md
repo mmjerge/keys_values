@@ -84,8 +84,8 @@ Through-cache EM (deployment condition), dense training **OOMs** here:
 - Eviction gap shrinks: nq 28pp -> 12-20pp; hotpot 16pp -> 6-14pp
 - **Not** a "sparse beats dense" claim -- dense inference still wins on
   every checkpoint
-- nq dense-eval mixed across seeds: answer-style vs substring-EM artifact
-  (inspected, documented, not quoted)
+- nq dense-eval mixed across seeds: generation inspection says per-seed
+  variance, not a confirmed style artifact (not quoted either way)
 
 # In flight: LongProc (the hard task)
 

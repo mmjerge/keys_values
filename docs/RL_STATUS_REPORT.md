@@ -76,11 +76,13 @@ Through-cache eval (the deployment condition), EM vs base:
 dense-vs-cached gap on the same checkpoint shrinks (nq 28pp -> 12-20pp;
 hotpot 16pp -> 6-14pp). Explicitly NOT claimed: sparse beating dense --
 dense inference still wins on every checkpoint, as A1/A2 predicts. The nq
-*dense-eval* column is mixed across seeds (+8/-12/-16) and is treated as
-metric-artifact territory: generation inspection shows training compresses
-verbose scaffolding to terse spans, which collides with nq's substring-EM
-(targets like "in Super Bowl LII"). Caveats: n=50 (SE ~7pp), one cache
-config, 200 steps.
+*dense-eval* column is mixed across seeds (+8/-12/-16) and is not quoted.
+Generation inspection across both tasks: on hotpot, training compressed
+answers to terse spans (F1-friendly, EM-safe there); on nq, the trained
+model kept base-like style and was more often factually correct on the
+inspected sample -- so the nq dense-eval spread reads as per-seed variance
+at n=50 rather than a confirmed style artifact. Caveats: n=50 (SE ~7pp),
+one cache config, 200 steps.
 
 Infra used: S3 job queue + self-provisioning workers + optional Terraform
 module (`terraform/`, autoscaling across all AZs/types -- single-GPU
