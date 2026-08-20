@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import Callable, Dict
 
+import os
+
 import torch
 
 import time
@@ -274,12 +276,18 @@ def grpo_step(
         epsilon_high=epsilon_high,
     )
     head.set_batch(advantages=advantages, old_logps=old_logps, mask=mask)
+    # Env-gated annotation tracing for debugging the chunked backward
+    # (issue #148); prints every annotation created/matched/unpacked.
+    _grad_kwargs = {}
+    if os.environ.get("KV_DEBUG_ANNOTATIONS") == "1":
+        _grad_kwargs["autograd_hooks_kwargs"] = dict(debug_print_annotations=True)
     grad_model = LongContextGradientModel(
         gpt_model=gpt_model,
         head_model=head,
         layers_per_cell=layers_per_cell,
         chunk_size=chunk_size,
         verbose=verbose,
+        **_grad_kwargs,
     )
     grad_model.train()
     if zero_grad:
