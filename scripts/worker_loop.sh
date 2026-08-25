@@ -6,13 +6,28 @@
 #   queue/claimed/<job>.sh     moved here (with instance-id suffix) on claim
 #   runs/<job>/                stdout log + any files the job leaves in $OUT
 #
-# Claiming is a copy+delete; S3 has no atomic move, so a rare double-claim is
-# possible -- harmless for idempotent experiment jobs (last writer wins on
-# upload, both produce the same result).
+# Claiming is a copy+delete; S3 has no atomic move, so a double-claim is
+# possible. Two workers running the same job is NOT harmless: they race on the
+# result upload, and on a shared GPU they OOM each other. After claiming we
+# therefore check for competing markers and back off unless we own the
+# lexicographically smallest instance id.
+#
+# Only one loop per instance: the script takes an flock on itself and exits if
+# another loop already holds it. Starting a second loop next to a running job
+# would put two trainings on one GPU and OOM both.
 #
 # Usage:  ./worker_loop.sh            # run until queue empty, then exit
 #         KV_STOP_WHEN_DONE=1 ./worker_loop.sh   # ...then stop this instance
 set -uo pipefail
+
+# Single-loop guard (re-exec under flock, unless already holding it)
+if [ "${KV_WORKER_LOCKED:-0}" != "1" ]; then
+    export KV_WORKER_LOCKED=1
+    exec flock -n "$HOME/.kv_worker.lock" "$0" "$@" || {
+        echo "another worker loop is already running on this instance"
+        exit 0
+    }
+fi
 
 BUCKET="s3://keys-values-rl-results"
 REGION="us-east-2"
@@ -36,6 +51,21 @@ while true; do
     aws s3 cp "$BUCKET/queue/pending/$JOB" "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
         --region $REGION --only-show-errors || continue
     aws s3 rm "$BUCKET/queue/pending/$JOB" --region $REGION --only-show-errors
+
+    # Resolve double-claims: if another instance also claimed this job, the
+    # smallest instance id wins and the others drop their marker and move on.
+    sleep $(( (RANDOM % 5) + 3 ))
+    OWNERS=$(aws s3 ls "$BUCKET/queue/claimed/" --region $REGION 2>/dev/null \
+             | awk '{print $4}' | grep "^${NAME}\." | sed "s/^${NAME}\.//; s/\.sh$//" \
+             | sort)
+    WINNER=$(echo "$OWNERS" | head -1)
+    if [ -n "$WINNER" ] && [ "$WINNER" != "$IID" ]; then
+        echo "double-claim on $NAME: $WINNER owns it, dropping our marker"
+        aws s3 rm "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
+            --region $REGION --only-show-errors
+        continue
+    fi
+
     aws s3 cp "$BUCKET/queue/claimed/${NAME}.${IID}.sh" "/tmp/${JOB}" \
         --region $REGION --only-show-errors
 
