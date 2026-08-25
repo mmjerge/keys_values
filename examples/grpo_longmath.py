@@ -125,6 +125,10 @@ def main() -> None:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--n-eval", type=int, default=16)
+    p.add_argument("--rescore-every", type=int, default=25,
+                   help="Every N steps, rescore old log-probs with a separate "
+                        "training-style forward and log decode-vs-forward "
+                        "per-token skew tail statistics (0 = never).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/grpo_longmath")
     p.add_argument("--eval-only", action="store_true")
@@ -241,11 +245,20 @@ def main() -> None:
                 zero_grad=(micro == 0),
                 optimizer_step=(micro == args.prompts_per_update - 1),
                 grad_scale=1.0 / args.prompts_per_update,
+                rescore_old_logps=(args.rescore_every > 0
+                                   and step % args.rescore_every == 0),
             ))
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
         dt = time.perf_counter() - t0
-        print(f"step {step:4d} | reward {mean_r:.3f} | {dt:.1f}s", flush=True)
-        history.append({"step": step, "reward": mean_r, "sec": dt})
+        entry = {"step": step, "reward": mean_r, "sec": dt}
+        skew_keys = [k for k in micro_metrics[0] if k.startswith("logp_skew")]
+        for key in skew_keys:
+            entry[key] = sum(m[key] for m in micro_metrics) / len(micro_metrics)
+        skew_msg = (f" | skew p90 {entry['logp_skew_p90']:.3f}"
+                    if "logp_skew_p90" in entry else "")
+        print(f"step {step:4d} | reward {mean_r:.3f} | {dt:.1f}s{skew_msg}",
+              flush=True)
+        history.append(entry)
         if step % args.eval_every == 0 and step < args.steps:
             history.append({"step": step, "eval": eval_model(f"step {step}")})
 

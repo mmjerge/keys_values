@@ -319,9 +319,27 @@ def grpo_step(
     if rescore_old_logps:
         # Quantify the rollout (decode) vs. training-forward log-prob skew over
         # real completion tokens -- a measure of the train/inference gap.
+        # Collapse (sparse rollout) is driven by the worst-mismatched tokens,
+        # not the average (cf. arXiv:2606.08446), so we log tail quantiles of
+        # the per-token skew alongside the mean.
         with torch.no_grad():
-            skew = ((gen_logps - old_logps).abs() * mask).sum() / mask.sum().clamp_min(1.0)
-        metrics["logp_skew_decode_vs_forward"] = float(skew.item())
+            per_token = (gen_logps - old_logps).abs()
+            skew = (per_token * mask).sum() / mask.sum().clamp_min(1.0)
+            metrics["logp_skew_decode_vs_forward"] = float(skew.item())
+            masked = per_token[mask.bool()].float()
+            if masked.numel() > 0:
+                quantiles = torch.quantile(
+                    masked,
+                    torch.tensor([0.5, 0.9, 0.99], device=masked.device),
+                )
+                metrics["logp_skew_p50"] = float(quantiles[0].item())
+                metrics["logp_skew_p90"] = float(quantiles[1].item())
+                metrics["logp_skew_p99"] = float(quantiles[2].item())
+                # Fraction of tokens whose decode-vs-forward probability
+                # ratio exceeds e (|delta logp| > 1): the "collapse tail"
+                metrics["logp_skew_frac_gt1"] = float(
+                    (masked > 1.0).float().mean().item()
+                )
     if profile:
         metrics.update(times)
     return metrics
