@@ -288,6 +288,12 @@ def grpo_step(
     # (issue #148); prints every annotation created/matched/unpacked.
     if os.environ.get("KV_DEBUG_ANNOTATIONS") == "1":
         autograd_hooks_kwargs["debug_print_annotations"] = True
+    # Diagnostic switch for issue #148 attribution experiments ONLY: revert to
+    # the old (broken) hooks configuration without `may_match_twice`, to
+    # demonstrate that multi-chunk annotation gaps reappear. Never set this
+    # for real training.
+    if os.environ.get("KV_DISABLE_MATCH_TWICE") == "1":
+        del autograd_hooks_kwargs["may_match_twice"]
     grad_model = LongContextGradientModel(
         gpt_model=gpt_model,
         head_model=head,
