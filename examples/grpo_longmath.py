@@ -185,6 +185,12 @@ def main() -> None:
     if args.use_flex:
         if args.device != "cuda":
             raise ValueError("--use-flex requires --device cuda")
+        # FlexAttention compiles a block-mask variant per (kv_len, q_len)
+        # shape. RL prompts vary in length, so the default dynamo cache
+        # limits are too small and we would recompile in a loop. The
+        # finetune scripts raise these via `sdpa.dynamo_cache_size_limit`.
+        torch._dynamo.config.cache_size_limit = 32
+        torch._dynamo.config.accumulated_cache_size_limit = 128
         q_lens = choose_q_lens(chunk_size=args.chunk_size, num_q_lens=4)
         fa_kwargs = dict(extend_kv=False, q_lens=q_lens)
         needs_attn_weights = args.kv_cache_name.startswith(("h2o", "qh2o"))
