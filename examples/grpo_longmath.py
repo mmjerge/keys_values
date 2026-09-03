@@ -54,6 +54,7 @@ from litgpt.utils import (
     load_checkpoint,
 )
 
+from keys_values.attention.flex_attention import FlexAttentionArgs, choose_q_lens
 from keys_values.config import Config
 from keys_values.data.constants import LIT_MODEL_FNAME
 from keys_values.kvcache.factory import (
@@ -132,6 +133,10 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/grpo_longmath")
     p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--use-flex", action="store_true",
+                   help="Enable the FlexAttention SDPA path (CUDA only). "
+                        "Without this, the training replay cache falls back "
+                        "to the zero-padded-query SDPA.")
     p.add_argument("--disable-flashinfer", action="store_true")
     p.add_argument("--access-token", default=None)
     args = p.parse_args()
@@ -170,8 +175,27 @@ def main() -> None:
           f"{len(eval_records)} eval records", flush=True)
 
     check_valid_checkpoint_dir(checkpoint_dir)
+    # Without `flexatt_args`, `mha.has_flex_attention` is False and the
+    # training replay cache falls back to the zero-padded-query SDPA (see
+    # `TrainingAttnWeightsReplayCache.__init__`). That path has different
+    # backward-order behaviour and much larger attention-weight temporaries
+    # than the FlexAttention path the finetune scripts use. Mirrors
+    # `finetune/longcontext_full.py::_mha_kwargs`.
+    mha_kwargs = {}
+    if args.use_flex:
+        if args.device != "cuda":
+            raise ValueError("--use-flex requires --device cuda")
+        q_lens = choose_q_lens(chunk_size=args.chunk_size, num_q_lens=4)
+        fa_kwargs = dict(extend_kv=False, q_lens=q_lens)
+        needs_attn_weights = args.kv_cache_name.startswith(("h2o", "qh2o"))
+        if needs_attn_weights:
+            # 2x FlexAttention baseline for the attention weights H2O needs
+            fa_kwargs["forward_return_lse"] = True
+        mha_kwargs["flexatt_args"] = FlexAttentionArgs(**fa_kwargs)
+        print(f"Using FlexAttention SDPA (q_lens={q_lens}, "
+              f"forward_return_lse={needs_attn_weights})", flush=True)
     with fabric.init_module(empty_init=True):
-        gpt_model = GPT(config)
+        gpt_model = GPT(config, **mha_kwargs)
     load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
     gpt_model.to(fabric.device)
 
