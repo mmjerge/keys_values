@@ -54,6 +54,7 @@ from litgpt.utils import (
     load_checkpoint,
 )
 
+from keys_values.array_limit import TemporaryArrayLimit
 from keys_values.attention.flex_attention import FlexAttentionArgs, choose_q_lens
 from keys_values.config import Config
 from keys_values.data.constants import LIT_MODEL_FNAME
@@ -133,6 +134,10 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/grpo_longmath")
     p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--attn-temp-gb", type=float, default=2.0,
+                   help="Limit (GiB) for eager attention-weight temporaries, "
+                        "as in finetune's attention_forward_temp_size_gb. "
+                        "0 disables the limit.")
     p.add_argument("--use-flex", action="store_true",
                    help="Enable the FlexAttention SDPA path (CUDA only). "
                         "Without this, the training replay cache falls back "
@@ -182,6 +187,14 @@ def main() -> None:
     # than the FlexAttention path the finetune scripts use. Mirrors
     # `finetune/longcontext_full.py::_mha_kwargs`.
     mha_kwargs = {}
+    # Bound the eager attention-weight temporaries (H2O needs attention
+    # weights; without a limit one softmax temporary at 32k is >2 GiB and
+    # OOMs the backward). Mirrors finetune's attention_forward_temp_size_gb.
+    if args.attn_temp_gb > 0:
+        mha_kwargs["tmp_array_limit_gb"] = TemporaryArrayLimit(
+            init_val=args.attn_temp_gb,
+            name="attention_forward_temp_size_gb",
+        )
     if args.use_flex:
         if args.device != "cuda":
             raise ValueError("--use-flex requires --device cuda")
@@ -208,6 +221,13 @@ def main() -> None:
     cache_kwargs = {}
     if args.kv_cache_name.startswith(("h2o", "qh2o")) and "orig" not in args.kv_cache_name:
         cache_kwargs["grace_period"] = args.cache_length // 16
+    # CRITICAL: the KV caches build their own MultiHeadSelfAttention from
+    # `cache_kwargs`, and the chunked-gradient cells reuse `kv_cache.mha`,
+    # NOT `gpt_model.mha` (see gradient/cell.py). Passing `flexatt_args` /
+    # `tmp_array_limit_gb` only to GPT() therefore does nothing for the
+    # training path -- the finetune scripts inject them into cache_kwargs for
+    # this reason (`cache_kwargs.update(mha_kwargs)` in longcontext_full.py).
+    cache_kwargs.update(mha_kwargs)
     gpt_model.assign_kv_caches(KVCacheFactory.create(
         gpt_model=gpt_model, name=args.kv_cache_name,
         max_batch_size=args.group_size, cache_length=args.cache_length,
