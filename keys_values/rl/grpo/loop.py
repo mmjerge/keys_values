@@ -145,6 +145,7 @@ def grpo_step(
     optimizer_step: bool = True,
     grad_scale: float = 1.0,
     advantage_mode: str = "grpo",
+    backward_tmp_gb: float = 0.0,
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -294,6 +295,15 @@ def grpo_step(
     # for real training.
     if os.environ.get("KV_DISABLE_MATCH_TWICE") == "1":
         del autograd_hooks_kwargs["may_match_twice"]
+    # Bound the size of temporary device arrays in the backward. Without
+    # this, single attention temporaries at 32k contexts exceed 2 GiB and
+    # OOM an otherwise-fitting configuration. Mirrors the finetune path.
+    _grad_limit_kwargs: Dict[str, Any] = {}
+    if backward_tmp_gb > 0:
+        _grad_limit_kwargs["backward_tmp_array_limit_gb"] = TemporaryArrayLimit(
+            init_val=backward_tmp_gb,
+            name="backward_tmp_array_limit_gb",
+        )
     grad_model = LongContextGradientModel(
         gpt_model=gpt_model,
         head_model=head,
@@ -301,6 +311,7 @@ def grpo_step(
         chunk_size=chunk_size,
         verbose=verbose,
         autograd_hooks_kwargs=autograd_hooks_kwargs,
+        **_grad_limit_kwargs,
     )
     grad_model.train()
     if zero_grad:

@@ -134,6 +134,9 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/grpo_longmath")
     p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--backward-tmp-gb", type=float, default=2.0,
+                   help="Limit (GiB) for temporary device arrays in the "
+                        "chunked backward (0 disables). Needed at 32k+.")
     p.add_argument("--attn-temp-gb", type=float, default=2.0,
                    help="Limit (GiB) for eager attention-weight temporaries, "
                         "as in finetune's attention_forward_temp_size_gb. "
@@ -297,6 +300,7 @@ def main() -> None:
                 grad_scale=1.0 / args.prompts_per_update,
                 rescore_old_logps=(args.rescore_every > 0
                                    and step % args.rescore_every == 0),
+                backward_tmp_gb=args.backward_tmp_gb,
             ))
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
         dt = time.perf_counter() - t0
