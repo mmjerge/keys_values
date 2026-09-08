@@ -149,3 +149,41 @@ def test_grpo_step_multiple_iterations():
             top_k=1,
         )
         assert torch.isfinite(torch.tensor(metrics["loss"]))
+
+
+def test_grpo_step_with_backward_tmp_limit():
+    """
+    `backward_tmp_gb > 0` must actually work end-to-end.
+
+    Regression guard: the limit is constructed inside `grpo_step`, so a
+    missing import is invisible to `import keys_values.rl.grpo.loop` and only
+    fails at call time -- which is how a GPU job died with
+    `NameError: name 'TemporaryArrayLimit' is not defined` after the module
+    imported cleanly.
+    """
+    torch.manual_seed(0)
+    num_prompts, prompt_len = 2, 8
+    group_size = 2
+    max_new_tokens = 6
+    cache_length = 32
+
+    batch_size = num_prompts * group_size
+    gpt_model, config = _make_model_with_caches(batch_size, cache_length)
+    prompt_ids = torch.randint(0, config.vocab_size, (num_prompts, prompt_len))
+
+    def reward_fn(prompts, completions):
+        return completions.float().mean(dim=1)
+
+    optimizer = torch.optim.SGD(gpt_model.parameters(), lr=0.01)
+    metrics = grpo_step(
+        gpt_model=gpt_model,
+        prompt_ids=prompt_ids,
+        reward_fn=reward_fn,
+        optimizer=optimizer,
+        group_size=group_size,
+        max_new_tokens=max_new_tokens,
+        chunk_size=16,
+        temperature=1.0,
+        backward_tmp_gb=2.0,
+    )
+    assert torch.isfinite(torch.tensor(metrics["loss"]))
