@@ -123,6 +123,63 @@ def compute_group_advantages(
     return advantages.reshape(-1)
 
 
+def _dense_baseline_backward(
+    gpt_model: GPT,
+    head: GRPOLossHeadModel,
+    model_input_ids: torch.Tensor,
+    completions: torch.Tensor,
+    grad_scale: float,
+) -> torch.Tensor:
+    """
+    Standard (non-chunked) dense backward, for the dense-RL baseline.
+
+    This is the comparison arm for the memory-bounded chunked path: same
+    model, same rollout, same advantages, same loss head, same
+    normalization. The *only* difference is how the gradient is computed --
+    one full-sequence forward with all activations retained, and a plain
+    ``backward()``, which is what standard RL implementations do.
+
+    Equivalence with :class:`LongContextGradientModel` (verified in
+    `test/rl/grpo/test_loop.py::test_dense_baseline_matches_chunked_gradient`):
+
+    * The KV caches are detached for the duration of the forward, so
+      attention runs as default causal self-attention over the full
+      sequence (see :meth:`GPT.forward`: training mode = no caches).
+    * The head returns the per-sequence *sum* of per-token losses; we then
+      apply ``scale_factor / num_target_entries`` exactly as
+      :meth:`LongContextInferenceModel._forward_with_targets` does, with
+      ``average_loss_per_batch=True`` semantics (mean over the batch), which
+      is the default of :class:`LongContextGradientModel`.
+    * The chunked path's ``loss.backward()`` on the per-sequence loss vector
+      accumulates gradients of the *mean* over sequences, so we call
+      ``.mean().backward()`` here. (Verified empirically: using ``.sum()``
+      made every gradient exactly ``batch_size`` times too large.)
+
+    Returns the per-sequence loss vector (detached-comparable to the chunked
+    path's return value).
+    """
+    kv_caches = gpt_model.get_kv_caches()
+    gpt_model.clear_kv_caches()
+    try:
+        gpt_model.max_seq_length = int(model_input_ids.shape[1])
+        logits = gpt_model(model_input_ids)
+        # `head.forward` slices the last `completions.shape[1]` positions, so
+        # passing the full logits aligns targets with their predictors
+        per_seq_sum = head(logits, completions, input_pos=0)
+        num_entries = head.num_target_entries(completions)
+        if num_entries is not None:
+            # `average_loss_per_batch=True` semantics
+            num_entries = num_entries.to(dtype=torch.float32).mean()
+            scale = grad_scale / num_entries.to(device=per_seq_sum.device)
+        else:
+            scale = grad_scale
+        loss = per_seq_sum * scale
+        loss.mean().backward()
+    finally:
+        gpt_model.assign_kv_caches(kv_caches)
+    return loss
+
+
 def grpo_step(
     gpt_model: GPT,
     prompt_ids: torch.Tensor,
@@ -147,6 +204,7 @@ def grpo_step(
     grad_scale: float = 1.0,
     advantage_mode: str = "grpo",
     backward_tmp_gb: float = 0.0,
+    dense_baseline: bool = False,
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -314,8 +372,17 @@ def grpo_step(
 
     # 6. Backward (+ optimizer step unless accumulating).
     with _phase_timer(times, "grad_time_ms", device):
-        loss = grad_model(model_input_ids, completions, scale_factor=grad_scale)
-        loss.backward()
+        if dense_baseline:
+            loss = _dense_baseline_backward(
+                gpt_model=gpt_model,
+                head=head,
+                model_input_ids=model_input_ids,
+                completions=completions,
+                grad_scale=grad_scale,
+            )
+        else:
+            loss = grad_model(model_input_ids, completions, scale_factor=grad_scale)
+            loss.backward()
         if optimizer_step:
             optimizer.step()
 

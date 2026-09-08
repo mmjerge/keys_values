@@ -147,6 +147,16 @@ def main() -> None:
     p.add_argument("--backward-tmp-gb", type=float, default=2.0,
                    help="Limit (GiB) for temporary device arrays in the "
                         "chunked backward (0 disables). Needed at 32k+.")
+    p.add_argument("--dense-baseline", action="store_true",
+                   help="Dense-RL baseline: compute the gradient with one "
+                        "full-sequence backward instead of the memory-bounded "
+                        "chunked path. Same loss and gradients (see "
+                        "test_dense_baseline_matches_chunked_gradient); much "
+                        "higher peak memory. Use for paper baselines.")
+    p.add_argument("--truncate-prompt", type=int, default=0,
+                   help="Truncate prompts to the last N tokens (0 = off). "
+                        "Used for the dense-truncated baseline: what dense RL "
+                        "can actually fit at a matched memory budget.")
     p.add_argument("--layers-per-cell", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.7,
                    help="Rollout sampling temperature. Long structured outputs "
@@ -258,6 +268,10 @@ def main() -> None:
             rec = train_records[(step * args.prompts_per_update + micro)
                                 % len(train_records)]
             prompt_ids = encode(rec).unsqueeze(0)
+            if args.truncate_prompt > 0:
+                # Dense-truncated baseline: keep only the tail of the prompt,
+                # i.e. what dense RL can fit at a matched memory budget
+                prompt_ids = prompt_ids[:, -args.truncate_prompt:]
 
             def reward_fn(p_ids, completion_ids):
                 vals = []
@@ -278,6 +292,7 @@ def main() -> None:
                 optimizer_step=(micro == args.prompts_per_update - 1),
                 grad_scale=1.0 / args.prompts_per_update,
                 backward_tmp_gb=args.backward_tmp_gb,
+                dense_baseline=args.dense_baseline,
             ))
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
         dt = time.perf_counter() - t0
