@@ -144,6 +144,9 @@ def main() -> None:
     p.add_argument("--optimizer", choices=["adamw", "paged_adamw8bit"],
                    default="paged_adamw8bit")
     p.add_argument("--chunk-size", type=int, default=1024)
+    p.add_argument("--backward-tmp-gb", type=float, default=2.0,
+                   help="Limit (GiB) for temporary device arrays in the "
+                        "chunked backward (0 disables). Needed at 32k+.")
     p.add_argument("--layers-per-cell", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.7,
                    help="Rollout sampling temperature. Long structured outputs "
@@ -274,6 +277,7 @@ def main() -> None:
                 zero_grad=(micro == 0),
                 optimizer_step=(micro == args.prompts_per_update - 1),
                 grad_scale=1.0 / args.prompts_per_update,
+                backward_tmp_gb=args.backward_tmp_gb,
             ))
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
         dt = time.perf_counter() - t0

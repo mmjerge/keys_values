@@ -44,6 +44,7 @@ import torch
 import time
 from contextlib import contextmanager
 
+from keys_values.array_limit import TemporaryArrayLimit
 from keys_values.finetune.utils import may_match_twice_flex_attention_sdpa
 from keys_values.rl.grpo.loss import GRPOLossHeadModel
 from keys_values.rl.grpo.rollout import generate_completions_with_logprobs
@@ -145,6 +146,7 @@ def grpo_step(
     optimizer_step: bool = True,
     grad_scale: float = 1.0,
     advantage_mode: str = "grpo",
+    backward_tmp_gb: float = 0.0,
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -288,6 +290,15 @@ def grpo_step(
     # (issue #148); prints every annotation created/matched/unpacked.
     if os.environ.get("KV_DEBUG_ANNOTATIONS") == "1":
         autograd_hooks_kwargs["debug_print_annotations"] = True
+    # Bound the size of temporary device arrays in the backward. Without
+    # this, single attention temporaries at 32k contexts exceed 2 GiB and
+    # OOM an otherwise-fitting configuration. Mirrors the finetune path.
+    _grad_limit_kwargs: Dict[str, Any] = {}
+    if backward_tmp_gb > 0:
+        _grad_limit_kwargs["backward_tmp_array_limit_gb"] = TemporaryArrayLimit(
+            init_val=backward_tmp_gb,
+            name="backward_tmp_array_limit_gb",
+        )
     grad_model = LongContextGradientModel(
         gpt_model=gpt_model,
         head_model=head,
@@ -295,6 +306,7 @@ def grpo_step(
         chunk_size=chunk_size,
         verbose=verbose,
         autograd_hooks_kwargs=autograd_hooks_kwargs,
+        **_grad_limit_kwargs,
     )
     grad_model.train()
     if zero_grad:
