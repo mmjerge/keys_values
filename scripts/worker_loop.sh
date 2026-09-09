@@ -39,6 +39,19 @@ while true; do
     aws s3 cp "$BUCKET/queue/claimed/${NAME}.${IID}.sh" "/tmp/${JOB}" \
         --region $REGION --only-show-errors
 
+    # Never start a job on a busy GPU. A second training process on the same
+    # device OOMs both at model-load time. This has happened twice, when a
+    # loop predating the flock guard was still running a job.
+    GPU_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [ -n "${GPU_USED:-}" ] && [ "$GPU_USED" -gt 2000 ]; then
+        echo "GPU busy (${GPU_USED} MiB used): returning $NAME to pending and exiting"
+        aws s3 cp "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
+            "$BUCKET/queue/pending/${JOB}" --region $REGION --only-show-errors
+        aws s3 rm "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
+            --region $REGION --only-show-errors
+        break
+    fi
+
     export OUT="$HOME/runs/$NAME"
     mkdir -p "$OUT"
     echo "=== running $NAME on $IID ($(date -u +%FT%TZ)) ==="
