@@ -296,8 +296,19 @@ def main() -> None:
             ))
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
         dt = time.perf_counter() - t0
-        print(f"step {step:4d} | reward {mean_r:.3f} | {dt:.1f}s", flush=True)
-        history.append({"step": step, "reward": mean_r, "sec": dt})
+        entry = {"step": step, "reward": mean_r, "sec": dt}
+        mem_msg = ""
+        for key in ("grad_peak_device_mib", "parked_peak_mib", "parked_peak_count"):
+            if key in micro_metrics[0]:
+                entry[key] = max(m[key] for m in micro_metrics)
+        if "grad_peak_device_mib" in entry:
+            mem_msg += f" | dev peak {entry['grad_peak_device_mib'] / 1024:.1f}G"
+        if "parked_peak_mib" in entry:
+            mem_msg += (f" | parked {entry['parked_peak_mib']:.0f}MiB"
+                        f"/{int(entry['parked_peak_count'])}")
+        print(f"step {step:4d} | reward {mean_r:.3f} | {dt:.1f}s{mem_msg}",
+              flush=True)
+        history.append(entry)
         if step % args.eval_every == 0:
             score = eval_model(f"step {step}")
             history.append({"step": step, "eval": score})

@@ -371,6 +371,8 @@ def grpo_step(
         optimizer.zero_grad(set_to_none=True)
 
     # 6. Backward (+ optimizer step unless accumulating).
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     with _phase_timer(times, "grad_time_ms", device):
         if dense_baseline:
             loss = _dense_baseline_backward(
@@ -395,6 +397,19 @@ def grpo_step(
         "total_completions": total,
         "mean_completion_tokens": float(mask.sum(dim=-1).mean().item()),
     }
+    # Memory accounting for the gradient pass. `grad_peak_device_mib` is the
+    # device peak during backward (comparable across the chunked and dense
+    # arms). `parked_peak_*` is the CPU memory retained by the issue-#148
+    # chain-walk parking, the measured counterpart of the bound in
+    # test_parked_memory_is_bounded_and_released.
+    if device.type == "cuda":
+        metrics["grad_peak_device_mib"] = torch.cuda.max_memory_allocated(device) / (
+            1 << 20
+        )
+    if not dense_baseline:
+        parked_bytes, parked_count = grad_model.last_parked_peak
+        metrics["parked_peak_mib"] = parked_bytes / (1 << 20)
+        metrics["parked_peak_count"] = float(parked_count)
     if rescore_old_logps:
         # Quantify the rollout (decode) vs. training-forward log-prob skew over
         # real completion tokens -- a measure of the train/inference gap.
