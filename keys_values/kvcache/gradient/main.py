@@ -597,11 +597,15 @@ class LongContextGradientModel(LongContextInferenceModel):
         # this backward (the per-cell logs are cleared just below). This is the
         # measured number behind the memory bound claimed in issue #148.
         if self._annotation_usage_logs:
+            # getattr: tolerate hooks builds without parked-state accounting
+            # (used for pre-fix A/B memory measurements)
             self._last_parked_peak_bytes = max(
-                log.parked_peak_bytes for log in self._annotation_usage_logs.values()
+                getattr(log, "parked_peak_bytes", 0)
+                for log in self._annotation_usage_logs.values()
             )
             self._last_parked_peak_count = max(
-                log.parked_peak_count for log in self._annotation_usage_logs.values()
+                getattr(log, "parked_peak_count", 0)
+                for log in self._annotation_usage_logs.values()
             )
         self._annotation_usage_logs = dict()
         gc.collect()
