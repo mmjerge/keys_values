@@ -37,15 +37,19 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict
 
+import functools
 import os
 
 import torch
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 import time
 from contextlib import contextmanager
 
 from keys_values.array_limit import TemporaryArrayLimit
+from keys_values.attention.base import do_softcapping
 from keys_values.finetune.utils import may_match_twice_flex_attention_sdpa
+from keys_values.kvcache.factory import deallocate_kv_cache_buffers_of_model
 from keys_values.rl.grpo.loss import GRPOLossHeadModel
 from keys_values.rl.grpo.rollout import generate_completions_with_logprobs
 from keys_values.kvcache.gradient.main import LongContextGradientModel
@@ -129,6 +133,8 @@ def _dense_baseline_backward(
     model_input_ids: torch.Tensor,
     completions: torch.Tensor,
     grad_scale: float,
+    activation_checkpointing: bool = True,
+    logits_chunk: int = 512,
 ) -> torch.Tensor:
     """
     Standard (non-chunked) dense backward, for the dense-RL baseline.
@@ -155,27 +161,84 @@ def _dense_baseline_backward(
       ``.mean().backward()`` here. (Verified empirically: using ``.sum()``
       made every gradient exactly ``batch_size`` times too large.)
 
+    Strong-baseline memory optimizations (all exact; none changes the loss
+    or gradient, only what is resident at once):
+
+    * **Activation checkpointing** of every transformer block
+      (`torch.utils.checkpoint`, non-reentrant), the standard dense trick.
+    * **One sequence per backward**: the group is processed sequence by
+      sequence with gradient accumulation. GRPO does not need the whole
+      group in one graph.
+    * **No full-vocabulary logits**: the LM head is applied only to the
+      completion positions, in chunks of `logits_chunk` tokens, and each
+      chunk is fed to the head immediately. A full `B x S x V` logits
+      tensor at 8k tokens is ~2.3 GiB per sequence in bf16 and was the
+      actual cause of the first dense OOM we observed (not attention).
+
+    A dense frontier measured without these would be a strawman.
+
     Returns the per-sequence loss vector (detached-comparable to the chunked
     path's return value).
     """
     kv_caches = gpt_model.get_kv_caches()
     gpt_model.clear_kv_caches()
+    blocks = gpt_model.transformer.h
+    orig_forwards = [b.forward for b in blocks]
+    # Per-batch head state, sliced per sequence below and restored after
+    advantages_all = head._advantages
+    old_logps_all = head._old_logps
+    mask_all = head._mask
     try:
+        # Free the (now detached) sparse cache buffers for the duration of
+        # the dense pass. They are reallocated lazily on the next forward.
+        deallocate_kv_cache_buffers_of_model(gpt_model)
         gpt_model.max_seq_length = int(model_input_ids.shape[1])
-        logits = gpt_model(model_input_ids)
-        # `head.forward` slices the last `completions.shape[1]` positions, so
-        # passing the full logits aligns targets with their predictors
-        per_seq_sum = head(logits, completions, input_pos=0)
+        if activation_checkpointing:
+            for block in blocks:
+                block.forward = functools.partial(
+                    torch_checkpoint,
+                    block.forward,
+                    use_reentrant=False,
+                )
+        batch_size, num = completions.shape
+        # `average_loss_per_batch=True` semantics, identical to the chunked
+        # path: every per-token loss is divided by the batch mean of valid
+        # token counts, then per-sequence sums are averaged over the batch.
         num_entries = head.num_target_entries(completions)
         if num_entries is not None:
-            # `average_loss_per_batch=True` semantics
-            num_entries = num_entries.to(dtype=torch.float32).mean()
-            scale = grad_scale / num_entries.to(device=per_seq_sum.device)
+            denom = num_entries.to(dtype=torch.float32).mean().item()
         else:
-            scale = grad_scale
-        loss = per_seq_sum * scale
-        loss.mean().backward()
+            denom = 1.0
+        per_seq_scale = grad_scale / (denom * batch_size)
+        losses = []
+        for b in range(batch_size):
+            head.set_batch(
+                advantages=advantages_all[b : b + 1],
+                old_logps=None if old_logps_all is None else old_logps_all[b : b + 1],
+                mask=None if mask_all is None else mask_all[b : b + 1],
+            )
+            hidden = gpt_model(model_input_ids[b : b + 1], skip_lm_head=True)
+            hidden = hidden[:, -num:, :]  # positions that predict completions
+            seq_sum = None
+            for start in range(0, num, logits_chunk):
+                end = min(start + logits_chunk, num)
+                logits = do_softcapping(
+                    gpt_model.lm_head(hidden[:, start:end, :]),
+                    thresh=gpt_model.config.final_logit_softcapping,
+                )
+                # `input_pos=0` resets the head's offset; later chunks
+                # advance it, exactly as consecutive cells do in the
+                # chunked path
+                part = head(logits, completions[b : b + 1, start:end], input_pos=start)
+                seq_sum = part if seq_sum is None else seq_sum + part
+            loss_b = seq_sum * per_seq_scale
+            loss_b.sum().backward()
+            losses.append(loss_b.detach() * batch_size)  # per-seq value as chunked path
+        loss = torch.cat(losses)
     finally:
+        for block, fwd in zip(blocks, orig_forwards):
+            block.forward = fwd
+        head.set_batch(advantages=advantages_all, old_logps=old_logps_all, mask=mask_all)
         gpt_model.assign_kv_caches(kv_caches)
     return loss
 
