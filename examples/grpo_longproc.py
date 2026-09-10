@@ -154,9 +154,10 @@ def main() -> None:
                         "test_dense_baseline_matches_chunked_gradient); much "
                         "higher peak memory. Use for paper baselines.")
     p.add_argument("--truncate-prompt", type=int, default=0,
-                   help="Truncate prompts to the last N tokens (0 = off). "
-                        "Used for the dense-truncated baseline: what dense RL "
-                        "can actually fit at a matched memory budget.")
+                   help="Prompt token budget (0 = off), applied in training "
+                        "AND evaluation. Instruction-preserving: keeps the "
+                        "head and tail of the prompt and cuts the document "
+                        "in the middle. For the dense-truncated baseline.")
     p.add_argument("--layers-per-cell", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.7,
                    help="Rollout sampling temperature. Long structured outputs "
@@ -226,8 +227,26 @@ def main() -> None:
         dtype=dtype, cache_kwargs=cache_kwargs))
 
     def encode(rec):
-        return tokenizer.encode(
+        ids = tokenizer.encode(
             prompt_style.apply(rec["input_prompt"]), device=fabric.device)
+        return truncate_prompt(ids, args.truncate_prompt)
+
+    def truncate_prompt(ids: torch.Tensor, budget: int) -> torch.Tensor:
+        """
+        Dense-truncated baseline: what dense RL can afford at a matched memory
+        budget. Applied identically in training and evaluation (a truncated
+        arm evaluated on full prompts would be a different system).
+
+        Instruction-preserving: LongProc prompts carry the task instructions
+        at the head AND the output-format instructions at the tail, with the
+        long document in between. Tail-only truncation would delete the task
+        statement; so we keep the first `budget // 4` and last
+        `budget - budget // 4` tokens and cut the middle of the document.
+        """
+        if budget <= 0 or ids.shape[-1] <= budget:
+            return ids
+        head_n = budget // 4
+        return torch.cat((ids[:head_n], ids[-(budget - head_n):]), dim=-1)
 
     @torch.no_grad()
     def eval_model(tag: str) -> float:
@@ -267,11 +286,7 @@ def main() -> None:
         for micro in range(args.prompts_per_update):
             rec = train_records[(step * args.prompts_per_update + micro)
                                 % len(train_records)]
-            prompt_ids = encode(rec).unsqueeze(0)
-            if args.truncate_prompt > 0:
-                # Dense-truncated baseline: keep only the tail of the prompt,
-                # i.e. what dense RL can fit at a matched memory budget
-                prompt_ids = prompt_ids[:, -args.truncate_prompt:]
+            prompt_ids = encode(rec).unsqueeze(0)  # truncation (if any) inside
 
             def reward_fn(p_ids, completion_ids):
                 vals = []
