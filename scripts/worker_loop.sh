@@ -92,6 +92,11 @@ while true; do
     echo "exit=$STATUS" >> "$OUT/job.log"
 
     aws s3 sync "$OUT" "$BUCKET/runs/$NAME/" --region $REGION --only-show-errors
+    # Local checkpoints are 15 GB each and are now in S3: drop them, or the
+    # disk fills after ~10 jobs and every later job dies on import.
+    if [ $? -eq 0 ]; then
+        rm -f "$OUT"/*.pt
+    fi
     if [ $STATUS -ne 0 ]; then
         # Park failed jobs visibly instead of silently draining the queue;
         # requeue after diagnosis with: aws s3 mv .../failed/X.sh .../pending/X.sh

@@ -147,6 +147,10 @@ def main() -> None:
     p.add_argument("--backward-tmp-gb", type=float, default=2.0,
                    help="Limit (GiB) for temporary device arrays in the "
                         "chunked backward (0 disables). Needed at 32k+.")
+    p.add_argument("--save-intermediate", action="store_true",
+                   help="Also save a full state_dict at every eval step "
+                        "(15 GB each for 7B). Off by default: this filled "
+                        "worker disks. final.pt is always written.")
     p.add_argument("--dense-baseline", action="store_true",
                    help="Dense-RL baseline: compute the gradient with one "
                         "full-sequence backward instead of the memory-bounded "
@@ -327,7 +331,11 @@ def main() -> None:
         if step % args.eval_every == 0:
             score = eval_model(f"step {step}")
             history.append({"step": step, "eval": score})
-            torch.save(gpt_model.state_dict(), out_dir / f"step{step}.pt")
+            if args.save_intermediate:
+                # 15 GB per checkpoint for a 7B model; with --eval-every 50
+                # this filled worker disks and killed a whole batch of runs.
+                # Off by default; final.pt is always written.
+                torch.save(gpt_model.state_dict(), out_dir / f"step{step}.pt")
 
     torch.save(gpt_model.state_dict(), out_dir / "final.pt")
     eval_model("final")
