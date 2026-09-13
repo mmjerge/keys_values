@@ -63,6 +63,11 @@ from keys_values.kvcache.factory import (
     deallocate_kv_cache_buffers_of_model,
 )
 from keys_values.long_context import LongContextInferenceModel
+from keys_values.lora import (
+    GPT as GPTLoRA,
+    Config as ConfigLoRA,
+    mark_only_lora_as_trainable,
+)
 from keys_values.model import GPT
 from keys_values.rl.grpo.loop import grpo_step
 from keys_values.rl.grpo.rollout import generate_completions
@@ -147,6 +152,10 @@ def main() -> None:
     p.add_argument("--backward-tmp-gb", type=float, default=2.0,
                    help="Limit (GiB) for temporary device arrays in the "
                         "chunked backward (0 disables). Needed at 32k+.")
+    p.add_argument("--lora-r", type=int, default=0,
+                   help="LoRA rank (0 = full fine-tuning). Adapters on "
+                        "q/k/v/proj/mlp, alpha=2r. Applies to sparse and "
+                        "dense arms alike.")
     p.add_argument("--save-intermediate", action="store_true",
                    help="Also save a full state_dict at every eval step "
                         "(15 GB each for 7B). Off by default: this filled "
@@ -195,7 +204,18 @@ def main() -> None:
     checkpoint_dir = auto_download_checkpoint(
         model_name=args.model, access_token=args.access_token)
     tokenizer = Tokenizer(checkpoint_dir)
-    config = Config.from_file(checkpoint_dir / "model_config.yaml")
+    if args.lora_r > 0:
+        # LoRA variant (same pattern as finetune_long_lora). Applied to BOTH
+        # the sparse and dense arms, so a LoRA comparison stays apples to
+        # apples; the point is a dense baseline that fits where full FT does
+        # not (optimizer state and gradients shrink to the adapter).
+        config = ConfigLoRA.from_file(
+            checkpoint_dir / "model_config.yaml",
+            lora_r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.0,
+            lora_query=True, lora_key=True, lora_value=True,
+            lora_projection=True, lora_mlp=True, lora_head=False)
+    else:
+        config = Config.from_file(checkpoint_dir / "model_config.yaml")
     prompt_style = (load_prompt_style(checkpoint_dir)
                     if has_prompt_style(checkpoint_dir)
                     else PromptStyle.from_config(config))
@@ -218,8 +238,13 @@ def main() -> None:
 
     check_valid_checkpoint_dir(checkpoint_dir)
     with fabric.init_module(empty_init=True):
-        gpt_model = GPT(config)
-    load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
+        gpt_model = GPTLoRA(config) if args.lora_r > 0 else GPT(config)
+    load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME,
+                    strict=(args.lora_r == 0))
+    if args.lora_r > 0:
+        mark_only_lora_as_trainable(gpt_model)
+        n_train = sum(p.numel() for p in gpt_model.parameters() if p.requires_grad)
+        print(f"LoRA r={args.lora_r}: {n_train / 1e6:.1f}M trainable params", flush=True)
     gpt_model.to(fabric.device)
 
     cache_kwargs = {}
@@ -276,11 +301,12 @@ def main() -> None:
         eval_model("base")
         return
 
+    trainable = [p for p in gpt_model.parameters() if p.requires_grad]
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(gpt_model.parameters(), lr=args.lr)
+        optimizer = torch.optim.AdamW(trainable, lr=args.lr)
     else:
         import bitsandbytes as bnb
-        optimizer = bnb.optim.PagedAdamW8bit(gpt_model.parameters(), lr=args.lr)
+        optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=args.lr)
 
     eval_model("step 0")
     history = []
