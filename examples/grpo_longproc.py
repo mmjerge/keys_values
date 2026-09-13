@@ -122,13 +122,26 @@ def shaped_score(eval_fn, metric: str, prediction: str, record: dict,
     climb out of the cold start. Eval always uses the unshaped primary
     metric.
     """
+    primary, fmt = score_components(eval_fn, metric, prediction, record)
+    return primary + format_bonus * fmt
+
+
+def score_components(eval_fn, metric: str, prediction: str,
+                     record: dict) -> tuple[float, float]:
+    """(primary metric, format adherence) for one completion, 0.0 on error.
+
+    Logged separately per step: the shaped reward alone cannot distinguish
+    "the model solves the task" from "the model learned to emit the fenced
+    block". Observed on countdown_8k: shaped reward flat at 0.20 while greedy
+    eval accuracy went 0.125 -> 0.000 -- the policy collected the format
+    bonus and lost the answer.
+    """
     try:
         metrics, _ = eval_fn(prediction, record)
-        primary = float(metrics.get(metric, 0.0))
-        fmt = float(metrics.get("extraction_rate", 0.0))
-        return primary + format_bonus * fmt
+        return (float(metrics.get(metric, 0.0)),
+                float(metrics.get("extraction_rate", 0.0)))
     except Exception:
-        return 0.0
+        return 0.0, 0.0
 
 
 def main() -> None:
@@ -313,6 +326,8 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         t0 = time.perf_counter()
         micro_metrics = []
+        step_primary: list[float] = []  # unshaped task metric per rollout
+        step_format: list[float] = []   # format adherence per rollout
         for micro in range(args.prompts_per_update):
             rec = train_records[(step * args.prompts_per_update + micro)
                                 % len(train_records)]
@@ -322,8 +337,10 @@ def main() -> None:
                 vals = []
                 for row in completion_ids:
                     text = tokenizer.decode(row[row != pad_id])
-                    vals.append(shaped_score(eval_fn, metric, text, rec,
-                                             args.format_bonus))
+                    primary, fmt = score_components(eval_fn, metric, text, rec)
+                    step_primary.append(primary)
+                    step_format.append(fmt)
+                    vals.append(primary + args.format_bonus * fmt)
                 return torch.tensor(vals, dtype=torch.float32)
 
             micro_metrics.append(grpo_step(
@@ -341,8 +358,12 @@ def main() -> None:
             ))
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
         dt = time.perf_counter() - t0
-        entry = {"step": step, "reward": mean_r, "sec": dt}
-        mem_msg = ""
+        n_roll = max(len(step_primary), 1)
+        mean_primary = sum(step_primary) / n_roll
+        mean_format = sum(step_format) / n_roll
+        entry = {"step": step, "reward": mean_r, "primary": mean_primary,
+                 "format": mean_format, "sec": dt}
+        mem_msg = f" | primary {mean_primary:.3f} fmt {mean_format:.2f}"
         for key in ("grad_peak_device_mib", "parked_peak_mib", "parked_peak_count"):
             if key in micro_metrics[0]:
                 entry[key] = max(m[key] for m in micro_metrics)
