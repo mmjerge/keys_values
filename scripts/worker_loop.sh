@@ -84,6 +84,12 @@ while true; do
         break
     fi
 
+    # Force a clean checkout before every job. A diagnostic job that reverted
+    # a file with 'git checkout <commit> -- <file>' left it STAGED as the old
+    # version; 'git pull' in later jobs preserved it, and a day of runs on
+    # this box silently used pre-fix code. Never trust the tree between jobs.
+    (cd "$HOME/keys_values" && git reset -q --hard HEAD && git clean -qfd -e repos/ -e runs/)
+
     export OUT="$HOME/runs/$NAME"
     mkdir -p "$OUT"
     echo "=== running $NAME on $IID ($(date -u +%FT%TZ)) ==="
