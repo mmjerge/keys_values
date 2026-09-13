@@ -149,3 +149,109 @@ def test_grpo_step_multiple_iterations():
             top_k=1,
         )
         assert torch.isfinite(torch.tensor(metrics["loss"]))
+
+
+def test_grpo_step_with_backward_tmp_limit():
+    """
+    `backward_tmp_gb > 0` must actually work end-to-end.
+
+    Regression guard: the limit is constructed inside `grpo_step`, so a
+    missing import is invisible to `import keys_values.rl.grpo.loop` and only
+    fails at call time -- which is how a GPU job died with
+    `NameError: name 'TemporaryArrayLimit' is not defined` after the module
+    imported cleanly.
+    """
+    torch.manual_seed(0)
+    num_prompts, prompt_len = 2, 8
+    group_size = 2
+    max_new_tokens = 6
+    cache_length = 32
+
+    batch_size = num_prompts * group_size
+    gpt_model, config = _make_model_with_caches(batch_size, cache_length)
+    prompt_ids = torch.randint(0, config.vocab_size, (num_prompts, prompt_len))
+
+    def reward_fn(prompts, completions):
+        return completions.float().mean(dim=1)
+
+    optimizer = torch.optim.SGD(gpt_model.parameters(), lr=0.01)
+    metrics = grpo_step(
+        gpt_model=gpt_model,
+        prompt_ids=prompt_ids,
+        reward_fn=reward_fn,
+        optimizer=optimizer,
+        group_size=group_size,
+        max_new_tokens=max_new_tokens,
+        chunk_size=16,
+        temperature=1.0,
+        backward_tmp_gb=2.0,
+    )
+    assert torch.isfinite(torch.tensor(metrics["loss"]))
+
+
+def test_dense_baseline_matches_chunked_gradient():
+    """
+    The dense baseline must compute the SAME loss and the SAME gradients as
+    the chunked path, so that paper comparisons isolate memory/feasibility
+    rather than a different objective.
+
+    Same seed -> same rollout, advantages and mask; the only difference is
+    the gradient computation (full-sequence backward vs chunked cells).
+    """
+    num_prompts, prompt_len = 2, 8
+    group_size = 2
+    max_new_tokens = 6
+    cache_length = 32
+
+    def run(dense: bool):
+        torch.manual_seed(7)
+        batch_size = num_prompts * group_size
+        gpt_model, config = _make_model_with_caches(batch_size, cache_length)
+        prompt_ids = torch.randint(0, config.vocab_size, (num_prompts, prompt_len))
+
+        def reward_fn(prompts, completions):
+            return completions.float().mean(dim=1)
+
+        optimizer = torch.optim.SGD(gpt_model.parameters(), lr=0.0)  # no update
+        torch.manual_seed(11)  # identical sampling in both arms
+        metrics = grpo_step(
+            gpt_model=gpt_model,
+            prompt_ids=prompt_ids,
+            reward_fn=reward_fn,
+            optimizer=optimizer,
+            group_size=group_size,
+            max_new_tokens=max_new_tokens,
+            chunk_size=16,
+            temperature=1.0,
+            dense_baseline=dense,
+        )
+        grads = {
+            name: p.grad.detach().clone()
+            for name, p in gpt_model.named_parameters()
+            if p.grad is not None
+        }
+        return metrics, grads
+
+    m_chunked, g_chunked = run(dense=False)
+    m_dense, g_dense = run(dense=True)
+
+    # Same rollout (sanity: the arms really are comparable)
+    assert m_chunked["total_completions"] == m_dense["total_completions"]
+    torch.testing.assert_close(
+        torch.tensor(m_chunked["mean_reward"]),
+        torch.tensor(m_dense["mean_reward"]),
+    )
+    # Same loss
+    torch.testing.assert_close(
+        torch.tensor(m_chunked["loss"]),
+        torch.tensor(m_dense["loss"]),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    # Same gradients
+    assert g_chunked and g_dense, "expected gradients in both arms"
+    assert set(g_chunked) == set(g_dense)
+    for name in g_chunked:
+        torch.testing.assert_close(
+            g_chunked[name], g_dense[name], rtol=2e-3, atol=2e-4, msg=name
+        )
