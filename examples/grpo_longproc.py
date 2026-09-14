@@ -191,6 +191,11 @@ def main() -> None:
     p.add_argument("--format-bonus", type=float, default=0.2,
                    help="Training-reward bonus per unit of format adherence "
                         "(extraction_rate); 0 disables shaping.")
+    p.add_argument("--format-gate", type=float, default=0.5,
+                   help="Pay the format bonus only while the fraction of "
+                        "parseable rollouts in the group is below this. "
+                        ">= 1.0 disables the gate (old always-on bonus, which "
+                        "the policy locked onto: countdown 0.125 -> 0.0).")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--n-eval", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
@@ -328,19 +333,36 @@ def main() -> None:
         micro_metrics = []
         step_primary: list[float] = []  # unshaped task metric per rollout
         step_format: list[float] = []   # format adherence per rollout
+        step_spread: list[float] = []   # 1.0 per group with non-identical rewards
         for micro in range(args.prompts_per_update):
             rec = train_records[(step * args.prompts_per_update + micro)
                                 % len(train_records)]
             prompt_ids = encode(rec).unsqueeze(0)  # truncation (if any) inside
 
             def reward_fn(p_ids, completion_ids):
-                vals = []
+                comps = []
                 for row in completion_ids:
                     text = tokenizer.decode(row[row != pad_id])
-                    primary, fmt = score_components(eval_fn, metric, text, rec)
-                    step_primary.append(primary)
-                    step_format.append(fmt)
-                    vals.append(primary + args.format_bonus * fmt)
+                    comps.append(score_components(eval_fn, metric, text, rec))
+                primaries = [c[0] for c in comps]
+                fmts = [c[1] for c in comps]
+                step_primary.extend(primaries)
+                step_format.extend(fmts)
+                # Gated format bonus. The bonus exists to create reward
+                # SPREAD inside a group during cold start (some rollouts hit
+                # the fenced format, some do not). Once most of the group
+                # formats, a flat bonus is a constant that RLOO's baseline
+                # removes -- but on the way there it is a standing reward the
+                # policy can lock onto (observed: countdown accuracy
+                # 0.125 -> 0.0 while shaped reward sat at exactly 0.20). So
+                # pay it only while fewer than half the group is parseable.
+                frac_fmt = sum(fmts) / max(len(fmts), 1)
+                gated_off = args.format_gate < 1.0 and frac_fmt >= args.format_gate
+                bonus = 0.0 if gated_off else args.format_bonus
+                vals = [p + bonus * f for p, f in zip(primaries, fmts)]
+                # Is there any gradient in this group? RLOO has one iff the
+                # rewards are not all identical.
+                step_spread.append(1.0 if max(vals) - min(vals) > 1e-9 else 0.0)
                 return torch.tensor(vals, dtype=torch.float32)
 
             micro_metrics.append(grpo_step(
@@ -361,9 +383,11 @@ def main() -> None:
         n_roll = max(len(step_primary), 1)
         mean_primary = sum(step_primary) / n_roll
         mean_format = sum(step_format) / n_roll
+        frac_spread = sum(step_spread) / max(len(step_spread), 1)
         entry = {"step": step, "reward": mean_r, "primary": mean_primary,
-                 "format": mean_format, "sec": dt}
-        mem_msg = f" | primary {mean_primary:.3f} fmt {mean_format:.2f}"
+                 "format": mean_format, "spread": frac_spread, "sec": dt}
+        mem_msg = (f" | primary {mean_primary:.3f} fmt {mean_format:.2f}"
+                   f" spread {frac_spread:.2f}")
         for key in ("grad_peak_device_mib", "parked_peak_mib", "parked_peak_count"):
             if key in micro_metrics[0]:
                 entry[key] = max(m[key] for m in micro_metrics)
