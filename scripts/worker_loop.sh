@@ -4,15 +4,33 @@
 # Queue layout in s3://keys-values-rl-results/:
 #   queue/pending/<job>.sh     one shell snippet per job (the command to run)
 #   queue/claimed/<job>.sh     moved here (with instance-id suffix) on claim
+#   queue/failed/<job>.sh      parked here if the job exits non-zero
 #   runs/<job>/                stdout log + any files the job leaves in $OUT
 #
-# Claiming is a copy+delete; S3 has no atomic move, so a rare double-claim is
-# possible -- harmless for idempotent experiment jobs (last writer wins on
-# upload, both produce the same result).
+# Three protections, each added after it cost us GPU hours:
+#
+# 1. One loop per instance (flock). Two loops on one box run two trainings on
+#    one GPU, which OOMs both at model-load time.
+# 2. Never start on a busy GPU. Belt-and-braces for (1): also covers a loop
+#    started before this guard existed, which cannot hold the lock.
+# 3. Resolve double claims. Claiming is copy+delete and S3 has no atomic
+#    move, so two workers can claim one job. That is not harmless: they race
+#    on the result upload and duplicate hours of compute. After claiming we
+#    look for competing markers and back off unless we own the smallest
+#    instance id.
 #
 # Usage:  ./worker_loop.sh            # run until queue empty, then exit
 #         KV_STOP_WHEN_DONE=1 ./worker_loop.sh   # ...then stop this instance
 set -uo pipefail
+
+# --- protection 1: single loop per instance ---------------------------------
+if [ "${KV_WORKER_LOCKED:-0}" != "1" ]; then
+    export KV_WORKER_LOCKED=1
+    exec flock -n "$HOME/.kv_worker.lock" "$0" "$@" || {
+        echo "another worker loop already holds the lock on this instance"
+        exit 0
+    }
+fi
 
 BUCKET="s3://keys-values-rl-results"
 REGION="us-east-2"
@@ -36,8 +54,41 @@ while true; do
     aws s3 cp "$BUCKET/queue/pending/$JOB" "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
         --region $REGION --only-show-errors || continue
     aws s3 rm "$BUCKET/queue/pending/$JOB" --region $REGION --only-show-errors
+
+    # --- protection 3: resolve double claims -------------------------------
+    # Wait out the window in which a competitor's marker may not be visible
+    # yet, then let the smallest instance id win.
+    sleep $(( (RANDOM % 5) + 8 ))
+    OWNERS=$(aws s3 ls "$BUCKET/queue/claimed/" --region $REGION 2>/dev/null \
+             | awk '{print $4}' | grep "^${NAME}\." \
+             | sed "s/^${NAME}\.//; s/\.sh$//" | sort)
+    WINNER=$(echo "$OWNERS" | head -1)
+    if [ -n "$WINNER" ] && [ "$WINNER" != "$IID" ]; then
+        echo "double claim on $NAME: $WINNER owns it, dropping our marker"
+        aws s3 rm "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
+            --region $REGION --only-show-errors
+        continue
+    fi
+
     aws s3 cp "$BUCKET/queue/claimed/${NAME}.${IID}.sh" "/tmp/${JOB}" \
         --region $REGION --only-show-errors
+
+    # --- protection 2: never start on a busy GPU ---------------------------
+    GPU_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [ -n "${GPU_USED:-}" ] && [ "$GPU_USED" -gt 2000 ]; then
+        echo "GPU busy (${GPU_USED} MiB used): returning $NAME to pending and exiting"
+        aws s3 cp "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
+            "$BUCKET/queue/pending/${JOB}" --region $REGION --only-show-errors
+        aws s3 rm "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
+            --region $REGION --only-show-errors
+        break
+    fi
+
+    # Force a clean checkout before every job. A diagnostic job that reverted
+    # a file with 'git checkout <commit> -- <file>' left it STAGED as the old
+    # version; 'git pull' in later jobs preserved it, and a day of runs on
+    # this box silently used pre-fix code. Never trust the tree between jobs.
+    (cd "$HOME/keys_values" && git reset -q --hard HEAD && git clean -qfd -e repos/ -e runs/)
 
     export OUT="$HOME/runs/$NAME"
     mkdir -p "$OUT"
@@ -47,6 +98,11 @@ while true; do
     echo "exit=$STATUS" >> "$OUT/job.log"
 
     aws s3 sync "$OUT" "$BUCKET/runs/$NAME/" --region $REGION --only-show-errors
+    # Local checkpoints are 15 GB each and are now in S3: drop them, or the
+    # disk fills after ~10 jobs and every later job dies on import.
+    if [ $? -eq 0 ]; then
+        rm -f "$OUT"/*.pt
+    fi
     if [ $STATUS -ne 0 ]; then
         # Park failed jobs visibly instead of silently draining the queue;
         # requeue after diagnosis with: aws s3 mv .../failed/X.sh .../pending/X.sh
