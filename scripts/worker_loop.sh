@@ -93,8 +93,22 @@ while true; do
     export OUT="$HOME/runs/$NAME"
     mkdir -p "$OUT"
     echo "=== running $NAME on $IID ($(date -u +%FT%TZ)) ==="
+    # GPU utilization sampling: one CSV per job, synced to S3 with the rest
+    # of $OUT. 10s cadence keeps a multi-day job under ~3 MB. The summary
+    # line in job.log makes utilization regressions (issue #152 class)
+    # visible at a glance instead of requiring live nvidia-smi eyeballing.
+    nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used \
+        --format=csv,noheader -l 10 > "$OUT/gpu_util.csv" 2>/dev/null &
+    SMI_PID=$!
     bash "/tmp/${JOB}" > "$OUT/job.log" 2>&1
     STATUS=$?
+    kill "$SMI_PID" 2>/dev/null
+    wait "$SMI_PID" 2>/dev/null
+    if [ -s "$OUT/gpu_util.csv" ]; then
+        awk -F', ' '{gsub(/ %/,"",$2); s+=$2; if ($2+0>m) m=$2; n++}
+            END {if (n) printf "gpu_util: mean=%.0f%% max=%d%% samples=%d\n", s/n, m, n}' \
+            "$OUT/gpu_util.csv" >> "$OUT/job.log"
+    fi
     echo "exit=$STATUS" >> "$OUT/job.log"
 
     aws s3 sync "$OUT" "$BUCKET/runs/$NAME/" --region $REGION --only-show-errors
