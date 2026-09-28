@@ -255,3 +255,133 @@ def test_dense_baseline_matches_chunked_gradient():
         torch.testing.assert_close(
             g_chunked[name], g_dense[name], rtol=2e-3, atol=2e-4, msg=name
         )
+
+
+def test_grpo_step_trains_lora_adapters():
+    """
+    LoRA adapters must receive gradients through the chunked backward and
+    change the policy's outputs. Added after two LoRA arms sat at exactly
+    the base-model eval for 90 steps: this test rules out the pipeline
+    (gradient routing, optimizer, eval path) so that a flat curve can be
+    attributed to the training recipe, not to a silent no-op.
+
+    `lora_B` is zero-initialised, so on the first step only `lora_B` gets a
+    non-zero gradient; `lora_A` follows once `lora_B` has moved. Hence the
+    check is over several steps, and on the greedy completion rather than
+    on a single gradient.
+    """
+    from keys_values.lora import (
+        GPT as GPTLoRA,
+        Config as ConfigLoRA,
+        mark_only_lora_as_trainable,
+    )
+    from keys_values.long_context import LongContextInferenceModel
+    from keys_values.rl.grpo.rollout import generate_completions
+    from keys_values.utils import VerbosityLevels
+
+    torch.manual_seed(0)
+    num_prompts, prompt_len, group_size, max_new_tokens = 2, 8, 2, 6
+    cache_length = 32
+    batch_size = num_prompts * group_size
+    config = ConfigLoRA(
+        block_size=512,
+        vocab_size=64,
+        padded_vocab_size=64,
+        n_layer=2,
+        n_head=4,
+        n_embd=32,
+        n_query_groups=2,
+        intermediate_size=64,
+        rotary_percentage=1,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_query=True,
+        lora_key=True,
+        lora_value=True,
+        lora_projection=True,
+        lora_mlp=True,
+        lora_head=False,
+    )
+    torch.set_default_dtype(torch.float32)
+    with torch.device("cpu"):
+        gpt_model = GPTLoRA(config)
+        gpt_model.apply(gpt_model._init_weights)
+    mark_only_lora_as_trainable(gpt_model)
+    gpt_model.assign_kv_caches(
+        KVCacheFactory.create(
+            gpt_model=gpt_model,
+            name="lastrec-default",
+            max_batch_size=batch_size,
+            cache_length=cache_length,
+            dtype=torch.float32,
+        )
+    )
+    trainable = [p for p in gpt_model.parameters() if p.requires_grad]
+    frozen = [p for p in gpt_model.parameters() if not p.requires_grad]
+    assert trainable and frozen
+    optimizer = torch.optim.AdamW(trainable, lr=1e-2)
+    prompt_ids = torch.randint(0, config.vocab_size, (num_prompts, prompt_len))
+
+    def reward_fn(prompts, completions):
+        return completions.float().mean(dim=1)
+
+    def greedy_completion() -> torch.Tensor:
+        # Same path as the drivers' eval: inference model + greedy decode
+        gpt_model.eval()
+        ids = prompt_ids[:1]
+        gpt_model.max_seq_length = ids.shape[1] + max_new_tokens
+        inf = LongContextInferenceModel(
+            gpt_model, head_model=None, chunk_size=16, verbose=VerbosityLevels.NONE
+        )
+        with torch.no_grad():
+            comp = generate_completions(
+                model=inf,
+                prompt_ids=ids,
+                max_new_tokens=max_new_tokens,
+                temperature=1.0,
+                top_k=1,
+                top_p=1.0,
+                eos_token_id=None,
+                pad_token_id=0,
+                no_inference_mode=True,
+            )
+        return comp[0].clone()
+
+    before_comp = greedy_completion()
+    before_lora = [p.detach().clone() for p in trainable]
+    before_frozen = [p.detach().clone() for p in frozen]
+    # First step: every LoRA module must receive a gradient on lora_B
+    grpo_step(
+        gpt_model=gpt_model,
+        prompt_ids=prompt_ids,
+        reward_fn=reward_fn,
+        optimizer=optimizer,
+        group_size=group_size,
+        max_new_tokens=max_new_tokens,
+        chunk_size=16,
+        temperature=1.0,
+        optimizer_step=False,
+    )
+    lora_b = [
+        p for n, p in gpt_model.named_parameters() if p.requires_grad and "lora_B" in n
+    ]
+    assert lora_b
+    for p in lora_b:
+        assert p.grad is not None and p.grad.abs().max() > 0
+    optimizer.step()
+    for _ in range(5):
+        grpo_step(
+            gpt_model=gpt_model,
+            prompt_ids=prompt_ids,
+            reward_fn=reward_fn,
+            optimizer=optimizer,
+            group_size=group_size,
+            max_new_tokens=max_new_tokens,
+            chunk_size=16,
+            temperature=1.0,
+        )
+    # All adapter tensors moved, base weights did not, and the policy changed
+    assert all(not torch.equal(b, a.detach()) for b, a in zip(before_lora, trainable))
+    assert all(torch.equal(b, a.detach()) for b, a in zip(before_frozen, frozen))
+    assert not torch.equal(before_comp, greedy_completion())
