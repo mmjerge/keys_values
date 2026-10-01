@@ -213,6 +213,9 @@ def main() -> None:
                         "with --kv-cache-name dense-default and a cache "
                         "length >= prompt + max-new-tokens.")
     p.add_argument("--layers-per-cell", type=int, default=1)
+    p.add_argument("--evict-every", type=int, default=1,
+                   help="Block eviction for H2O caches: rank slots once per "
+                        "B decoded tokens instead of every token (1 = off).")
     p.add_argument("--temperature", type=float, default=1.0,
                    help="Rollout sampling temperature (RLVR standard: 1.0).")
     p.add_argument("--eval-every", type=int, default=50)
@@ -279,6 +282,8 @@ def main() -> None:
     cache_kwargs = {}
     if args.kv_cache_name.startswith(("h2o", "qh2o")) and "orig" not in args.kv_cache_name:
         cache_kwargs["grace_period"] = args.cache_length // 16
+    if args.evict_every > 1:
+        cache_kwargs["evict_every"] = args.evict_every
     gpt_model.assign_kv_caches(KVCacheFactory.create(
         gpt_model=gpt_model, name=args.kv_cache_name,
         max_batch_size=max(args.group_size, args.eval_samples),

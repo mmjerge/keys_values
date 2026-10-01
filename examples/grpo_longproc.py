@@ -185,6 +185,9 @@ def main() -> None:
                         "head and tail of the prompt and cuts the document "
                         "in the middle. For the dense-truncated baseline.")
     p.add_argument("--layers-per-cell", type=int, default=1)
+    p.add_argument("--evict-every", type=int, default=1,
+                   help="Block eviction for H2O caches: rank slots once per "
+                        "B decoded tokens instead of every token (1 = off).")
     p.add_argument("--temperature", type=float, default=0.7,
                    help="Rollout sampling temperature. Long structured outputs "
                         "derail badly at 1.0 (zero parseable rollouts observed).")
@@ -268,6 +271,8 @@ def main() -> None:
     cache_kwargs = {}
     if args.kv_cache_name.startswith(("h2o", "qh2o")) and "orig" not in args.kv_cache_name:
         cache_kwargs["grace_period"] = args.cache_length // 16
+    if args.evict_every > 1:
+        cache_kwargs["evict_every"] = args.evict_every
     gpt_model.assign_kv_caches(KVCacheFactory.create(
         gpt_model=gpt_model, name=args.kv_cache_name,
         max_batch_size=args.group_size, cache_length=args.cache_length,
