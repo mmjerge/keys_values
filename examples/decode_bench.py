@@ -33,6 +33,13 @@ kwargs, since the config list itself is comma-separated), e.g.
     h2o-torch-quantized8@8192
     h2o-torch-quantized8@8192:evict_every=64
     h2o-default@8192:grace_period=512;evict_every=64
+    h2o-default@8192:attn=flex          (per-config attention backend)
+
+The attention backend is `--attn` (default) or per config via `attn=`:
+  eager      eager SDPA (what runs when FlashInfer is not built)
+  flashinfer vendored FlashInfer decode kernel + Triton score sum (needs
+             `python build_ext.py`)
+  flex       FlexAttention baseline, 2x call to return LSE for H2O scores
 
 With `--profile`, a torch.profiler trace of the decode loop is taken for each
 config and the top CUDA kernels by self time are printed, which tells us
@@ -67,6 +74,7 @@ from keys_values.kvcache.factory import (
 )
 from keys_values.long_context import LongContextInferenceModel
 from keys_values.model import GPT
+from keys_values.attention.flex_attention import FlexAttentionArgs, choose_q_lens
 from keys_values.rl.grpo.rollout import generate_completions
 from keys_values.utils import VerbosityLevels
 
@@ -116,15 +124,24 @@ def main() -> None:
     p.add_argument("--profile", action="store_true",
                    help="torch.profiler on the decode loop; print top kernels.")
     p.add_argument("--profile-top", type=int, default=15)
+    p.add_argument("--attn", default="flashinfer",
+                   choices=["eager", "flashinfer", "flex"],
+                   help="Attention backend (overridable per config with attn=).")
     p.add_argument("--out", default="runs/decode_bench/results.json")
     p.add_argument("--disable-flashinfer", action="store_true")
     p.add_argument("--access-token", default=None)
     args = p.parse_args()
 
-    if args.disable_flashinfer:
-        from keys_values.attention import flashinfer_ops
+    from keys_values.attention import flashinfer_ops
 
-        flashinfer_ops._available = False
+    if args.disable_flashinfer:
+        args.attn = "eager"
+    flashinfer_built = flashinfer_ops._available
+    if not flashinfer_built:
+        print("NOTE: FlashInfer extension not built; 'flashinfer' configs run eager",
+              flush=True)
+    torch._dynamo.config.cache_size_limit = 32
+    torch._dynamo.config.accumulated_cache_size_limit = 128
 
     torch.manual_seed(0)
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
@@ -148,7 +165,7 @@ def main() -> None:
     specs = [parse_cache_spec(s) for s in args.caches.split(",")]
     results = []
     total_new = args.warmup_tokens + args.new_tokens
-    print(f"{'context':>8} {'cache':<44} {'prefill s':>10} {'decode s':>9} "
+    print(f"{'context':>8} {'cache':<52} {'prefill s':>10} {'decode s':>9} "
           f"{'tok/s':>8} {'ms/step':>8} {'peak GB':>8}", flush=True)
     for L_ctx in ctx_lens:
         # Random prompt: content does not matter for timing; avoid EOS so no
@@ -165,9 +182,22 @@ def main() -> None:
             else:
                 cache_length = min(budget or seq_total, seq_total)
             cache_kwargs = dict(kwargs)
+            attn = cache_kwargs.pop("attn", args.attn)
+            label = f"{label} [{attn}]"
+            needs_weights = name.startswith(("h2o", "qh2o"))
             if name.startswith(("h2o", "qh2o")) and "orig" not in name \
                     and "grace_period" not in cache_kwargs:
                 cache_kwargs["grace_period"] = cache_length // 16
+            # The caches build their own MultiHeadSelfAttention from
+            # cache_kwargs, so the backend selection has to go in here.
+            flashinfer_ops._available = flashinfer_built and attn == "flashinfer"
+            if attn == "flex":
+                cache_kwargs["flexatt_args"] = FlexAttentionArgs(
+                    extend_kv=False,
+                    q_lens=choose_q_lens(chunk_size=args.chunk_size, num_q_lens=4),
+                    forward_return_lse=needs_weights)
+            elif attn == "eager":
+                cache_kwargs["use_eager_sdpa_always"] = needs_weights
             deallocate_kv_cache_buffers_of_model(gpt_model)
             try:
                 gpt_model.assign_kv_caches(KVCacheFactory.create(
@@ -224,7 +254,7 @@ def main() -> None:
                            batch=args.batch, new_tokens=args.new_tokens,
                            prefill_s=t_prefill, decode_s=t_decode, tok_s=tok_s,
                            ms_per_step=ms_step, peak_gb=peak)
-                print(f"{L_ctx:>8} {label:<44} {t_prefill:>10.2f} {t_decode:>9.2f} "
+                print(f"{L_ctx:>8} {label:<52} {t_prefill:>10.2f} {t_decode:>9.2f} "
                       f"{tok_s:>8.1f} {ms_step:>8.1f} {peak:>8.2f}", flush=True)
                 if prof is not None:
                     # torch >= 2.x renamed self_cuda_time_total -> self_device_time_total
@@ -244,7 +274,7 @@ def main() -> None:
                     row["profile_top"] = top
                 results.append(row)
             except torch.cuda.OutOfMemoryError if device.type == "cuda" else MemoryError:
-                print(f"{L_ctx:>8} {label:<44} {'OOM':>10}", flush=True)
+                print(f"{L_ctx:>8} {label:<52} {'OOM':>10}", flush=True)
                 results.append(dict(context=L_ctx, cache=label, oom=True))
                 deallocate_kv_cache_buffers_of_model(gpt_model)
                 if device.type == "cuda":
