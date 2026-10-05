@@ -227,8 +227,11 @@ def main() -> None:
                 print(f"{L_ctx:>8} {label:<44} {t_prefill:>10.2f} {t_decode:>9.2f} "
                       f"{tok_s:>8.1f} {ms_step:>8.1f} {peak:>8.2f}", flush=True)
                 if prof is not None:
-                    key = ("self_cuda_time_total" if device.type == "cuda"
-                           else "self_cpu_time_total")
+                    # torch >= 2.x renamed self_cuda_time_total -> self_device_time_total
+                    key = "self_cpu_time_total"
+                    if device.type == "cuda":
+                        key = next(k for k in ("self_device_time_total", "self_cuda_time_total")
+                                   if hasattr(next(iter(prof.key_averages())), k))
                     print(prof.key_averages().table(
                         sort_by=key, row_limit=args.profile_top), flush=True)
                     top = []

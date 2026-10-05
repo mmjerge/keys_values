@@ -4,10 +4,11 @@
 #   scripts/queue_rlvr_jobs.sh probe  <model> <arm>            [prefix]
 #   scripts/queue_rlvr_jobs.sh train  <model> <arm> <seeds>    [prefix]
 #
-#   arm = h2o<K>   bounded evicting cache, K slots (e.g. h2o4096)
+#   arm = h2o<K>   bounded evicting bf16 cache, K slots (e.g. h2o4096)
+#       | q8h2o<K> same with int8 KV (slower decode, smaller)
 #       | dense    dense-default cache sized to prompt + generation
 #
-# Env knobs: KV_MAXNEW (8192), KV_STEPS (200), KV_GROUP (8), KV_EVAL_SETS
+# Env knobs: KV_MAXNEW (16384), KV_STEPS (200), KV_GROUP (8), KV_EVAL_SETS
 # (math500,aime24,aime25,amc23), KV_N_EVAL (0 = full sets), KV_EVAL_SAMPLES
 # (1), KV_TRAIN (deepscaler), KV_BRANCH (rl-longproc), KV_EXTRA (appended).
 #
@@ -25,7 +26,7 @@ fi
 BUCKET="s3://keys-values-rl-results"
 REGION="us-east-2"
 BRANCH="${KV_BRANCH:-rl-longproc}"
-MAXNEW="${KV_MAXNEW:-8192}"
+MAXNEW="${KV_MAXNEW:-16384}"
 STEPS="${KV_STEPS:-200}"
 GROUP="${KV_GROUP:-8}"
 EVAL_SETS="${KV_EVAL_SETS:-math500,aime24,aime25,amc23}"
@@ -35,7 +36,8 @@ TRAIN="${KV_TRAIN:-deepscaler}"
 EXTRA="${KV_EXTRA:-}"
 
 case "$ARM" in
-  h2o*)  CACHE_ARGS="--kv-cache-name h2o-torch-quantized8 --cache-length ${ARM#h2o}" ;;
+  h2o*)  CACHE_ARGS="--kv-cache-name h2o-default --cache-length ${ARM#h2o}" ;;
+  q8h2o*) CACHE_ARGS="--kv-cache-name h2o-torch-quantized8 --cache-length ${ARM#q8h2o}" ;;
   dense) # prompts are a few hundred tokens; 1024 headroom covers them
          CACHE_ARGS="--kv-cache-name dense-default --cache-length $((MAXNEW + 1024)) --dense-baseline" ;;
   *)     echo "unknown arm: $ARM" >&2; exit 2 ;;

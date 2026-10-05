@@ -193,13 +193,17 @@ def main() -> None:
                    help="k for avg@k. Sparrow: 16 on AIME, 4 on AMC.")
     p.add_argument("--eval-temperature", type=float, default=0.6)
     p.add_argument("--eval-top-p", type=float, default=0.95)
-    p.add_argument("--kv-cache-name", default="h2o-torch-quantized8")
+    p.add_argument("--kv-cache-name", default="h2o-default",
+                   help="bf16 H2O by default: int8 (h2o-torch-quantized8) costs "
+                        "~1/3 of decode throughput for 1.5 GB at K=8192 (see "
+                        "decode_bench, 7B/L40S).")
     p.add_argument("--cache-length", type=int, default=4096)
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--prompts-per-update", type=int, default=2)
     p.add_argument("--adv-mode", choices=["grpo", "rloo"], default="grpo")
-    p.add_argument("--max-new-tokens", type=int, default=8192,
-                   help="Generation cutoff. Sparrow: 37k thinking, 12k base.")
+    p.add_argument("--max-new-tokens", type=int, default=16384,
+                   help="Generation cutoff. At 8k, 80%% of Qwen3-1.7B AIME samples "
+                        "end inside <think>. Sparrow: 37k thinking, 12k base.")
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-6)
     p.add_argument("--optimizer", choices=["adamw", "paged_adamw8bit"],
