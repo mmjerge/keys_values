@@ -54,3 +54,26 @@ int8 stays available (`h2o-torch-quantized8`) for the gradient pass where
 No eviction gap on either set at K=4096 with 5-8k-token completions. The
 8k cutoff is the problem: 80% of AIME samples run out of budget mid-thought.
 Default cutoff raised to 16k.
+
+## Caveat found 2026-10-05: the whole table above is eager SDPA
+
+The vendored FlashInfer extension (`python build_ext.py`) had never been
+built on the workers, and every job script passed `--disable-flashinfer`.
+For the H2O path, which needs per-slot attention weights, the fallback is the
+eager blocked SDPA (`masked_fill` / `softmax` / `mean` in the profile). The
+dense arm at `q_len=1` was on the q-padded PyTorch SDPA, also not the fast
+path. So the table measures eager-vs-eager; the *shape* of the result (dense
+grows with context then OOMs, bounded cache flat) stands, the absolute
+tokens/s do not.
+
+Fixed: `scripts/provision_worker.sh` now builds the extension with the host
+GPU's arch (L40S is sm_89; build_ext.py only listed sm_80/sm_90), both idle
+workers have it, and `queue_rlvr_jobs.sh` only passes `--disable-flashinfer`
+when the kernels are missing. `decode_bench.py` has `--attn
+{eager,flashinfer,flex}` (also per config, `attn=`). Job
+`aa0_decode_bench_7b_backends` reruns the table with all three backends plus
+the int8 torch and BnB quantizers, and profiles the FlashInfer H2O path.
+
+Side finding while validating the build: the FlashInfer decode kernel returns
+NaN attention weights for `kv_len < 128` (split-KV merge over empty chunks);
+fine for every real cache size. Filed as awslabs/keys_values#156.
