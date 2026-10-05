@@ -211,8 +211,9 @@ def main() -> None:
                    default="paged_adamw8bit")
     p.add_argument("--chunk-size", type=int, default=1024)
     p.add_argument("--attn", default="auto", choices=ATTN_BACKENDS,
-                   help="Attention backend: auto = FlashInfer if built else "
-                        "FlexAttention (never eager); flex; eager (baseline only).")
+                   help="Attention backend: auto = FlashInfer if built, else eager "
+                        "with a loud warning (Flex recompiles per kv_len in decode); "
+                        "flex (gradient-pass experiments); eager (baseline).")
     p.add_argument("--backward-tmp-gb", type=float, default=2.0)
     p.add_argument("--lora-r", type=int, default=0)
     p.add_argument("--save-intermediate", action="store_true")
@@ -282,7 +283,7 @@ def main() -> None:
     # Attention backend. Must reach both the model and the caches (the caches
     # build their own MHA, and the gradient cells reuse kv_cache.mha).
     mha_kwargs = attention_mha_kwargs(
-        backend="flex" if args.disable_flashinfer and args.attn == "auto" else args.attn,
+        backend="eager" if args.disable_flashinfer and args.attn == "auto" else args.attn,
         kv_cache_name=args.kv_cache_name, chunk_size=args.chunk_size,
         device=fabric.device)
     with fabric.init_module(empty_init=True):

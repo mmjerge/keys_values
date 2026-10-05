@@ -14,25 +14,34 @@
 """
 Attention-backend selection for the RL drivers.
 
-:class:`MultiHeadSelfAttention` only considers FlexAttention when it is handed
-a :class:`FlexAttentionArgs`; its default is ``None``. The finetune scripts
-always construct one (``finetune/longcontext_full.py::_mha_kwargs``), but the
-RL examples built ``GPT(config)`` bare, so whenever the FlashInfer extension was
-not built, caches that need attention weights (H2O) fell through to the eager
-SDPA. This module mirrors the finetune defaults so that eager is never reached
-silently:
+Caches that need attention weights (H2O) have three SDPA implementations in
+:meth:`MultiHeadSelfAttention._sdpa_mode`: FlashInfer (vendored kernels, must
+be built with ``python build_ext.py``), the 2x FlexAttention baseline (only if
+a :class:`FlexAttentionArgs` is passed), and eager. The RL examples used to
+build ``GPT(config)`` bare and so silently ran eager whenever FlashInfer was
+not built.
 
-* ``auto``: FlashInfer if the extension is built, else the 2x FlexAttention
-  baseline for attention weights, Flex for everything else. Never eager.
-* ``flex``: FlexAttention even if FlashInfer is built.
-* ``eager``: the naive implementation (baselines and debugging only).
+Why ``auto`` does NOT fall back to FlexAttention: the Flex manager compiles one
+kernel per exact ``kv_len`` (``FlexAttnForPrefillManager._get_args``) and calls
+``torch.compile`` on every miss. In token-by-token decoding ``kv_len`` changes
+every step until the cache is full, so every decode step recompiles (observed:
+a 2-step smoke test did not finish in 25 minutes). The finetune scripts never
+generate, which is why they can default to Flex. Until Flex buckets ``kv_len``,
+FlashInfer is the only fast path for RL rollouts, and the right fix for a
+worker without it is to build it (``scripts/provision_worker.sh``), not to
+pick a different kernel.
 
-The returned kwargs must go to BOTH ``GPT(config, **mha_kwargs)`` and
-``cache_kwargs`` for :meth:`KVCacheFactory.create`: the caches build their own
+* ``auto``:  FlashInfer if built. Otherwise eager, with a loud warning.
+* ``flex``:  FlexAttention (gradient-pass experiments only; decode recompiles).
+* ``eager``: the naive implementation (baselines and debugging).
+
+Returned kwargs go to BOTH ``GPT(config, **mha_kwargs)`` and ``cache_kwargs``
+of :meth:`KVCacheFactory.create`: the caches build their own
 ``MultiHeadSelfAttention`` and the chunked-gradient cells reuse ``kv_cache.mha``.
 """
 
-from typing import Any, Dict, Optional
+import warnings
+from typing import Any, Dict
 
 import torch
 
@@ -42,11 +51,17 @@ from keys_values.attention.flex_attention import FlexAttentionArgs, choose_q_len
 
 ATTN_BACKENDS = ("auto", "flex", "eager")
 
-# FlexAttention compiles a block-mask variant per (kv_len, q_len) shape. RL
-# prompts vary in length, so the stock dynamo cache limits are far too small
-# and compilation would loop. Same values as finetune's SDPAArgs defaults.
+# FlexAttention compiles a block-mask variant per (kv_len, q_len) shape; the
+# stock dynamo limits are far too small. Same values as finetune's SDPAArgs.
 DYNAMO_CACHE_SIZE_LIMIT = 32
 DYNAMO_ACCUMULATED_CACHE_SIZE_LIMIT = 128
+
+EAGER_WARNING = (
+    "FlashInfer extension is not built: KV cache '{name}' needs attention "
+    "weights and will run the EAGER SDPA (several times slower in decode). "
+    "Build it with `pip install flashinfer-python && python build_ext.py` "
+    "(see scripts/provision_worker.sh)."
+)
 
 
 def needs_attn_weights(kv_cache_name: str) -> bool:
@@ -63,16 +78,16 @@ def attention_mha_kwargs(
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    Keyword arguments for :class:`MultiHeadSelfAttention` selecting the attention
-    backend. Pass to ``GPT(config, **kwargs)`` and merge into ``cache_kwargs``.
+    Keyword arguments for :class:`MultiHeadSelfAttention` selecting the
+    attention backend. Pass to ``GPT(config, **kwargs)`` and merge into
+    ``cache_kwargs``.
 
     Args:
         backend: One of :data:`ATTN_BACKENDS`.
         kv_cache_name: Cache name; decides whether attention weights are needed.
         chunk_size: Prefill / gradient chunk size, anchors the Flex ``q_lens``.
-        device: Flex needs CUDA; on CPU the result is eager regardless.
+        device: FlashInfer and Flex need CUDA; on CPU the result is eager.
         attn_temp_gb: If ``> 0``, bound eager attention-weight temporaries (GiB).
-            Only matters on the eager path; harmless otherwise.
         num_q_lens: Number of anchor ``q_len`` values for Flex compilation.
         verbose: Print the chosen backend.
     """
@@ -84,16 +99,9 @@ def attention_mha_kwargs(
         kwargs["tmp_array_limit_gb"] = TemporaryArrayLimit(
             init_val=attn_temp_gb, name="attention_forward_temp_size_gb"
         )
-    if device.type != "cuda" or backend == "eager":
-        # No flexatt_args: _sdpa_mode falls through to eager when attention
-        # weights are needed, and to PyTorch SDPA otherwise. Do NOT set
-        # use_eager_sdpa_always: the training replay cache rejects it.
-        if backend == "eager" and flashinfer_ops._available:
-            flashinfer_ops._available = False
-        chosen = "eager" if weights else "pytorch-sdpa"
-    else:
-        if backend == "flex":
-            flashinfer_ops._available = False
+    cuda = device.type == "cuda"
+    if backend == "flex" and cuda:
+        flashinfer_ops._available = False
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, DYNAMO_CACHE_SIZE_LIMIT
         )
@@ -104,15 +112,28 @@ def attention_mha_kwargs(
         kwargs["flexatt_args"] = FlexAttentionArgs(
             extend_kv=False,
             q_lens=choose_q_lens(chunk_size=chunk_size, num_q_lens=num_q_lens),
-            # 2x Flex call returning LSE, so H2O gets its per-slot weights
-            # without the eager path. Ignored by _sdpa_mode if FlashInfer wins.
             forward_return_lse=weights,
         )
-        flashinfer = flashinfer_ops._available and backend == "auto"
+        chosen = "flex" + (" (2x, return_lse)" if weights else "")
+        warnings.warn(
+            "FlexAttention recompiles for every new kv_len; token-by-token "
+            "decoding will be extremely slow. Use for gradient-pass experiments.",
+            stacklevel=2,
+        )
+    else:
+        # No flexatt_args, no use_eager_sdpa_always (the training replay
+        # cache rejects the latter). _sdpa_mode then picks FlashInfer when
+        # available and the call needs it, PyTorch SDPA for causal prefill,
+        # and eager only for attention-weight calls without FlashInfer.
+        if backend == "eager":
+            flashinfer_ops._available = False
+        flashinfer = cuda and flashinfer_ops._available
         if weights:
-            chosen = "flashinfer" if flashinfer else "flex (2x, return_lse)"
+            chosen = "flashinfer" if flashinfer else "eager"
+            if not flashinfer and backend == "auto" and cuda:
+                warnings.warn(EAGER_WARNING.format(name=kv_cache_name), stacklevel=2)
         else:
-            chosen = "flex" + (" + flashinfer" if flashinfer else "")
+            chosen = "pytorch-sdpa" + (" + flashinfer decode" if flashinfer else "")
     if verbose:
         print(
             f"attention backend: {chosen} (requested {backend}; "
@@ -122,8 +143,8 @@ def attention_mha_kwargs(
     return kwargs
 
 
-def describe_backend(mha_kwargs: Dict[str, Any]) -> Optional[str]:
+def describe_backend(mha_kwargs: Dict[str, Any]) -> str:
     """Short label for logs/results, derived from the kwargs."""
     if "flexatt_args" in mha_kwargs:
-        return "flashinfer" if flashinfer_ops._available else "flex"
-    return "eager"
+        return "flex"
+    return "flashinfer" if flashinfer_ops._available else "eager"
