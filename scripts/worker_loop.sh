@@ -89,6 +89,24 @@ while true; do
     # version; 'git pull' in later jobs preserved it, and a day of runs on
     # this box silently used pre-fix code. Never trust the tree between jobs.
     (cd "$HOME/keys_values" && git reset -q --hard HEAD && git clean -qfd -e repos/ -e runs/)
+    # The FlashInfer .so is gitignored and survives the clean above, so a
+    # job that pulls a changed kernel source would otherwise run the OLD
+    # binary. Rebuild when any csrc file is newer than the .so (or no .so).
+    (cd "$HOME/keys_values" && {
+        SO=$(ls keys_values/_flashinfer_ops*.so 2>/dev/null | head -1)
+        if [ -z "$SO" ] || [ -n "$(find keys_values/csrc -newer "$SO" -type f | head -1)" ]; then
+            echo "FlashInfer kernels missing or stale: rebuilding"
+            CC_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+            ( unset LD_LIBRARY_PATH; export PATH=/usr/local/cuda/bin:$PATH
+              pip install -q flashinfer-python
+              sed -i "s/-gencode=arch=compute_90,code=sm_90/-gencode=arch=compute_${CC_ARCH},code=sm_${CC_ARCH}/" build_ext.py
+              rm -f keys_values/_flashinfer_ops*.so; rm -rf build
+              python build_ext.py > "$HOME/flashinfer_build.log" 2>&1 \
+                  && python -c "import torch, keys_values._flashinfer_ops" && echo "FlashInfer OK" \
+                  || echo "FlashInfer build FAILED (see ~/flashinfer_build.log); jobs will run eager" )
+            git checkout -q build_ext.py
+        fi
+    })
 
     export OUT="$HOME/runs/$NAME"
     mkdir -p "$OUT"
