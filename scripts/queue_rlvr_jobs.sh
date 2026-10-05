@@ -65,9 +65,12 @@ pip install -q bitsandbytes==0.49.1 math-verify==0.8.0
 # "cublasLtGetVersion" (exit 134); torch finds its own libs without this.
 unset LD_LIBRARY_PATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Use the FlashInfer kernels if this worker has them built (provision_worker.sh);
+# otherwise say so loudly rather than silently running eager.
+if python -c "import torch, keys_values._flashinfer_ops" 2>/dev/null; then FI=""; else FI="--disable-flashinfer"; echo "WARNING: FlashInfer not built on this worker, running eager SDPA"; fi
 python examples/grpo_rlvr.py --device cuda --model ${MODEL} \\
     ${CACHE_ARGS} --max-new-tokens ${MAXNEW} --chunk-size 1024 \\
-    ${RUN_ARGS} --disable-flashinfer ${EXTRA} --out-dir \$OUT
+    ${RUN_ARGS} \$FI ${EXTRA} --out-dir \$OUT
 EOF
   aws s3 cp "$TMP/$NAME.sh" "$BUCKET/queue/pending/$NAME.sh" \
       --region $REGION --only-show-errors
