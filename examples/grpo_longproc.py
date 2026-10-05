@@ -69,6 +69,7 @@ from keys_values.lora import (
     mark_only_lora_as_trainable,
 )
 from keys_values.model import GPT
+from keys_values.rl.grpo.attention import ATTN_BACKENDS, attention_mha_kwargs
 from keys_values.rl.grpo.loop import grpo_step
 from keys_values.rl.grpo.rollout import generate_completions
 from keys_values.utils import VerbosityLevels
@@ -162,6 +163,9 @@ def main() -> None:
     p.add_argument("--optimizer", choices=["adamw", "paged_adamw8bit"],
                    default="paged_adamw8bit")
     p.add_argument("--chunk-size", type=int, default=1024)
+    p.add_argument("--attn", default="auto", choices=ATTN_BACKENDS,
+                   help="Attention backend: auto = FlashInfer if built else "
+                        "FlexAttention (never eager); flex; eager (baseline only).")
     p.add_argument("--backward-tmp-gb", type=float, default=2.0,
                    help="Limit (GiB) for temporary device arrays in the "
                         "chunked backward (0 disables). Needed at 32k+.")
@@ -258,8 +262,14 @@ def main() -> None:
           f"reward metric = {metric}")
 
     check_valid_checkpoint_dir(checkpoint_dir)
+    # Attention backend. Must reach both the model and the caches (the caches
+    # build their own MHA, and the gradient cells reuse kv_cache.mha).
+    mha_kwargs = attention_mha_kwargs(
+        backend="flex" if args.disable_flashinfer and args.attn == "auto" else args.attn,
+        kv_cache_name=args.kv_cache_name, chunk_size=args.chunk_size,
+        device=fabric.device)
     with fabric.init_module(empty_init=True):
-        gpt_model = GPTLoRA(config) if args.lora_r > 0 else GPT(config)
+        gpt_model = GPTLoRA(config, **mha_kwargs) if args.lora_r > 0 else GPT(config, **mha_kwargs)
     load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME,
                     strict=(args.lora_r == 0))
     if args.lora_r > 0:
@@ -268,7 +278,7 @@ def main() -> None:
         print(f"LoRA r={args.lora_r}: {n_train / 1e6:.1f}M trainable params", flush=True)
     gpt_model.to(fabric.device)
 
-    cache_kwargs = {}
+    cache_kwargs = dict(mha_kwargs)
     if args.kv_cache_name.startswith(("h2o", "qh2o")) and "orig" not in args.kv_cache_name:
         cache_kwargs["grace_period"] = args.cache_length // 16
     if args.evict_every > 1:
