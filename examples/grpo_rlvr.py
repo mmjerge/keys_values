@@ -86,7 +86,8 @@ TRAIN_SETS = {
     "deepscaler": ("agentica-org/DeepScaleR-Preview-Dataset", None, "train",
                    "problem", "answer"),
     "polaris": ("POLARIS-Project/Polaris-Dataset-53K", None, "train",
-                "problem", "answer"),
+                "problem", "answer"),  # has "difficulty" = k/8 solved by the ref model
+
 }
 EVAL_SETS = {
     "math500": ("HuggingFaceH4/MATH-500", None, "test", "problem", "answer"),
@@ -96,11 +97,21 @@ EVAL_SETS = {
 }
 
 
-def load_problems(key: str, table: dict, limit: int = 0, seed: int = 42) -> list[dict]:
+def load_problems(key: str, table: dict, limit: int = 0, seed: int = 42,
+                  difficulty_max: int = 0) -> list[dict]:
     repo, cfg, split, q_col, a_col = table[key]
     ds = load_dataset(repo, cfg, split=split) if cfg else load_dataset(repo, split=split)
-    recs = [{"problem": r[q_col], "answer": str(r[a_col]), "id": f"{key}:{i}"}
+    recs = [{"problem": r[q_col], "answer": str(r[a_col]), "id": f"{key}:{i}",
+             "difficulty": r.get("difficulty")}
             for i, r in enumerate(ds)]
+    if difficulty_max:
+        # Polaris: "k/8" = reference-model solve rate; keep the hard end.
+        def hard(r):
+            d = r.get("difficulty")
+            return d is not None and "/" in str(d) and int(str(d).split("/")[0]) <= difficulty_max
+        n0 = len(recs)
+        recs = [r for r in recs if hard(r)]
+        print(f"{key}: difficulty <= {difficulty_max}/8 keeps {len(recs)}/{n0}", flush=True)
     if limit and limit < len(recs):
         # Deterministic subset so paired comparisons across runs share
         # problems (same discipline as the HELMET split manifests).
@@ -183,9 +194,15 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
     p.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
-    p.add_argument("--train-dataset", default="deepscaler", choices=sorted(TRAIN_SETS))
+    p.add_argument("--train-dataset", default="polaris", choices=sorted(TRAIN_SETS),
+                   help="Polaris by default: Qwen3-1.7B solves most of DeepScaleR "
+                        "outright (MATH500 0.94 @16k), so groups have no reward "
+                        "spread and GRPO gets no gradient.")
     p.add_argument("--train-limit", type=int, default=0,
                    help="Deterministic subset of the training set (0 = all).")
+    p.add_argument("--difficulty-max", type=int, default=0,
+                   help="Polaris only: keep problems with difficulty <= N/8 "
+                        "(0 = no filter).")
     p.add_argument("--eval-sets", default="math500,aime24,aime25,amc23",
                    help="Comma-separated subset of " + ",".join(sorted(EVAL_SETS)))
     p.add_argument("--n-eval", type=int, default=0,
@@ -231,6 +248,13 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/grpo_rlvr")
     p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--checkpoint", default=None,
+                   help="state_dict (final.pt) to load before evaluating; with "
+                        "--eval-only this scores a trained policy.")
+    p.add_argument("--final-eval-samples", type=int, default=0,
+                   help="k for the final avg@k (0 = same as --eval-samples). "
+                        "Lets training use cheap avg@1 checks and finish with "
+                        "e.g. avg@16 on AIME.")
     p.add_argument("--disable-flashinfer", action="store_true")
     p.add_argument("--access-token", default=None)
     args = p.parse_args()
@@ -275,7 +299,8 @@ def main() -> None:
         print(f"eval {k}: {len(v)} problems x {args.eval_samples} samples", flush=True)
     train_records = []
     if not args.eval_only:
-        train_records = load_problems(args.train_dataset, TRAIN_SETS, args.train_limit)
+        train_records = load_problems(args.train_dataset, TRAIN_SETS, args.train_limit,
+                                      difficulty_max=args.difficulty_max)
         random.Random(args.seed).shuffle(train_records)
         print(f"train {args.train_dataset}: {len(train_records)} problems", flush=True)
 
@@ -292,6 +317,10 @@ def main() -> None:
                     strict=(args.lora_r == 0))
     if args.lora_r > 0:
         mark_only_lora_as_trainable(gpt_model)
+    if args.checkpoint:
+        sd = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        gpt_model.load_state_dict(sd, strict=True)
+        print(f"loaded policy from {args.checkpoint}", flush=True)
     gpt_model.to(fabric.device)
 
     cache_kwargs = dict(mha_kwargs)
@@ -301,7 +330,7 @@ def main() -> None:
         cache_kwargs["evict_every"] = args.evict_every
     gpt_model.assign_kv_caches(KVCacheFactory.create(
         gpt_model=gpt_model, name=args.kv_cache_name,
-        max_batch_size=max(args.group_size, args.eval_samples),
+        max_batch_size=max(args.group_size, args.eval_samples, args.final_eval_samples),
         cache_length=args.cache_length, dtype=dtype, cache_kwargs=cache_kwargs))
 
     def encode(rec):
@@ -309,9 +338,10 @@ def main() -> None:
                                 device=fabric.device)
 
     @torch.no_grad()
-    def eval_model(tag: str) -> dict[str, float]:
+    def eval_model(tag: str, k: int = 0) -> dict[str, float]:
         """avg@k per eval set; also logs mean completion length and the
         fraction of samples that ran out of budget inside <think>."""
+        k = k or args.eval_samples
         gpt_model.eval()
         out = {}
         for name, recs in eval_sets.items():
@@ -324,7 +354,7 @@ def main() -> None:
                     gpt_model, head_model=None, chunk_size=args.chunk_size,
                     verbose=VerbosityLevels.NONE)
                 comp = generate_completions(
-                    model=inf, prompt_ids=ids.repeat(args.eval_samples, 1),
+                    model=inf, prompt_ids=ids.repeat(k, 1),
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.eval_temperature, top_k=None,
                     top_p=args.eval_top_p, eos_token_id=eos_id,
@@ -338,14 +368,14 @@ def main() -> None:
                     scores.append(answer_reward(text, rec["answer"]))
             acc = sum(scores) / max(len(scores), 1)
             out[name] = acc
-            print(f"[eval @ {tag}] {name} avg@{args.eval_samples} = {acc:.3f} "
+            print(f"[eval @ {tag}] {name} avg@{k} = {acc:.3f} "
                   f"(n={len(recs)}) | mean len {sum(lengths) / max(len(lengths), 1):.0f} "
                   f"| truncated {truncated / max(len(scores), 1):.2f} "
                   f"| {time.perf_counter() - t0:.0f}s", flush=True)
         return out
 
     if args.eval_only:
-        res = eval_model("base")
+        res = eval_model("checkpoint" if args.checkpoint else "base", k=args.final_eval_samples)
         with open(out_dir / "eval_base.json", "w") as f:
             json.dump(res, f, indent=2)
         return
@@ -411,7 +441,7 @@ def main() -> None:
             json.dump(history, f, indent=2)
 
     torch.save(gpt_model.state_dict(), out_dir / "final.pt")
-    history.append({"step": args.steps, "eval": eval_model("final")})
+    history.append({"step": args.steps, "eval": eval_model("final", k=args.final_eval_samples)})
     with open(out_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
     print(f"done; artifacts in {out_dir}")
