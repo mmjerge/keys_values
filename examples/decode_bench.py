@@ -53,6 +53,7 @@ Example (one L40S):
 """
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -189,8 +190,13 @@ def main() -> None:
                     and "grace_period" not in cache_kwargs:
                 cache_kwargs["grace_period"] = cache_length // 16
             # The caches build their own MultiHeadSelfAttention from
-            # cache_kwargs, so the backend selection has to go in here.
-            flashinfer_ops._available = flashinfer_built and attn == "flashinfer"
+            # cache_kwargs, so the backend selection has to go in here. Select
+            # via the MHA kwarg: toggling flashinfer_ops._available poisons the
+            # lazily-cached FlashInferSDPA singleton for every later config.
+            if attn != "flashinfer":
+                cache_kwargs["use_flashinfer"] = False
+            elif not flashinfer_built:
+                label = label.replace("[flashinfer]", "[eager: not built]")
             if attn == "flex":
                 cache_kwargs["flexatt_args"] = FlexAttentionArgs(
                     extend_kv=False,
@@ -276,9 +282,15 @@ def main() -> None:
             except torch.cuda.OutOfMemoryError if device.type == "cuda" else MemoryError:
                 print(f"{L_ctx:>8} {label:<52} {'OOM':>10}", flush=True)
                 results.append(dict(context=L_ctx, cache=label, oom=True))
-                deallocate_kv_cache_buffers_of_model(gpt_model)
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+            # Release everything from this config before the next one. The
+            # OOM traceback keeps the generation frames (and their tensors)
+            # alive until the except block is left, so collect afterwards; a
+            # later config inheriting that memory would OOM spuriously.
+            comp = prof = inf = None
+            deallocate_kv_cache_buffers_of_model(gpt_model)
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:

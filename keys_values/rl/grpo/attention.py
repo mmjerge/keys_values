@@ -101,7 +101,7 @@ def attention_mha_kwargs(
         )
     cuda = device.type == "cuda"
     if backend == "flex" and cuda:
-        flashinfer_ops._available = False
+        kwargs["use_flashinfer"] = False
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, DYNAMO_CACHE_SIZE_LIMIT
         )
@@ -126,8 +126,8 @@ def attention_mha_kwargs(
         # available and the call needs it, PyTorch SDPA for causal prefill,
         # and eager only for attention-weight calls without FlashInfer.
         if backend == "eager":
-            flashinfer_ops._available = False
-        flashinfer = cuda and flashinfer_ops._available
+            kwargs["use_flashinfer"] = False
+        flashinfer = cuda and flashinfer_ops._available and backend != "eager"
         if weights:
             chosen = "flashinfer" if flashinfer else "eager"
             if not flashinfer and backend == "auto" and cuda:
@@ -147,4 +147,6 @@ def describe_backend(mha_kwargs: Dict[str, Any]) -> str:
     """Short label for logs/results, derived from the kwargs."""
     if "flexatt_args" in mha_kwargs:
         return "flex"
-    return "flashinfer" if flashinfer_ops._available else "eager"
+    if mha_kwargs.get("use_flashinfer", True) and flashinfer_ops._available:
+        return "flashinfer"
+    return "eager"
