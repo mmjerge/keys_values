@@ -41,7 +41,11 @@ import lightning as L
 import torch
 from litgpt.prompts import PromptStyle, has_prompt_style, load_prompt_style
 from litgpt.tokenizer import Tokenizer
-from litgpt.utils import auto_download_checkpoint, check_valid_checkpoint_dir, load_checkpoint
+from litgpt.utils import (
+    auto_download_checkpoint,
+    check_valid_checkpoint_dir,
+    load_checkpoint,
+)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from grpo_helmet import evaluate, targets_of  # noqa: E402
@@ -64,8 +68,12 @@ def main() -> None:
     p.add_argument("--max-length", default="8k")
     p.add_argument("--dataset-parent-dir", default=None)
     p.add_argument("--kv-cache-name", default="h2o-torch-quantized8")
-    p.add_argument("--cache-length", type=int, default=4096,
-                   help="KV cache budget; 0 = size to the longest sequence (dense).")
+    p.add_argument(
+        "--cache-length",
+        type=int,
+        default=4096,
+        help="KV cache budget; 0 = size to the longest sequence (dense).",
+    )
     p.add_argument("--prompts-per-update", type=int, default=2)
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--steps", type=int, default=400)
@@ -83,19 +91,29 @@ def main() -> None:
 
     if args.disable_flashinfer:
         from keys_values.attention import flashinfer_ops
+
         flashinfer_ops._available = False
 
-    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.jsonl"
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
-    fabric = L.Fabric(devices=1, accelerator=args.device,
-                      precision="32-true" if args.device == "cpu" else "bf16-true")
+    fabric = L.Fabric(
+        devices=1,
+        accelerator=args.device,
+        precision="32-true" if args.device == "cpu" else "bf16-true",
+    )
 
-    checkpoint_dir = auto_download_checkpoint(model_name=args.model, access_token=args.access_token)
+    checkpoint_dir = auto_download_checkpoint(
+        model_name=args.model, access_token=args.access_token
+    )
     tokenizer = Tokenizer(checkpoint_dir)
     config = Config.from_file(checkpoint_dir / "model_config.yaml")
-    prompt_style = (load_prompt_style(checkpoint_dir) if has_prompt_style(checkpoint_dir)
-                    else PromptStyle.from_config(config))
+    prompt_style = (
+        load_prompt_style(checkpoint_dir)
+        if has_prompt_style(checkpoint_dir)
+        else PromptStyle.from_config(config)
+    )
     pad_id = tokenizer.processor.token_to_id("<|endoftext|>")
     if pad_id is None:
         pad_id = int(tokenizer.eos_id) if tokenizer.eos_id is not None else 0
@@ -122,10 +140,12 @@ def main() -> None:
     lens = [int(s.size(0)) for s in full_seqs]
     max_len = max(lens)
     cache_length = args.cache_length or (max_len + 8)
-    print(f"HELMET {args.dataset_key}/{args.max_length}: {len(train_records)} train, "
-          f"{len(eval_records)} eval; seq tokens avg={sum(lens)//len(lens)} max={max_len}; "
-          f"cache={args.kv_cache_name}@{cache_length} "
-          f"({'EVICTING' if cache_length < max_len else 'no eviction'})")
+    print(
+        f"HELMET {args.dataset_key}/{args.max_length}: {len(train_records)} train, "
+        f"{len(eval_records)} eval; seq tokens avg={sum(lens)//len(lens)} max={max_len}; "
+        f"cache={args.kv_cache_name}@{cache_length} "
+        f"({'EVICTING' if cache_length < max_len else 'no eviction'})"
+    )
 
     check_valid_checkpoint_dir(checkpoint_dir)
     with fabric.init_module(empty_init=True):
@@ -133,20 +153,42 @@ def main() -> None:
     load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
     gpt_model.to(fabric.device)
     cache_kwargs = {}
-    if args.kv_cache_name.startswith(("h2o", "qh2o")) and "orig" not in args.kv_cache_name:
+    if (
+        args.kv_cache_name.startswith(("h2o", "qh2o"))
+        and "orig" not in args.kv_cache_name
+    ):
         cache_kwargs["grace_period"] = cache_length // 16
-    gpt_model.assign_kv_caches(KVCacheFactory.create(
-        gpt_model=gpt_model, name=args.kv_cache_name, max_batch_size=1,
-        cache_length=cache_length, dtype=dtype, cache_kwargs=cache_kwargs))
+    gpt_model.assign_kv_caches(
+        KVCacheFactory.create(
+            gpt_model=gpt_model,
+            name=args.kv_cache_name,
+            max_batch_size=1,
+            cache_length=cache_length,
+            dtype=dtype,
+            cache_kwargs=cache_kwargs,
+        )
+    )
     optimizer = torch.optim.AdamW(gpt_model.parameters(), lr=args.lr)
 
-    caps = [kvc.cache_length - (getattr(kvc, "grace_period", 0)
-            or getattr(kvc, "init_grace_tokens", 0) or 0)
-            for kvc in gpt_model.get_kv_caches() if kvc is not None]
+    caps = [
+        kvc.cache_length
+        - (getattr(kvc, "grace_period", 0) or getattr(kvc, "init_grace_tokens", 0) or 0)
+        for kvc in gpt_model.get_kv_caches()
+        if kvc is not None
+    ]
     chunk_size = max(min([args.chunk_size] + caps), 1)
 
-    acc0 = evaluate(gpt_model, eval_records, tokenizer, prompt_style, pad_id, eos_id,
-                    args.max_new_tokens, chunk_size, fabric)
+    acc0 = evaluate(
+        gpt_model,
+        eval_records,
+        tokenizer,
+        prompt_style,
+        pad_id,
+        eos_id,
+        args.max_new_tokens,
+        chunk_size,
+        fabric,
+    )
     print(f"step 0 | eval_acc {acc0:.3f}", flush=True)
     with metrics_path.open("a") as f:
         f.write(json.dumps({"step": 0, "eval_acc": acc0}) + "\n")
@@ -165,20 +207,35 @@ def main() -> None:
             gpt_model.max_seq_length = int(full.shape[1])
             head = CrossEntropyOnLogits(gpt_model.config)
             grad_model = LongContextGradientModel(
-                gpt_model=gpt_model, head_model=head,
-                layers_per_cell=args.layers_per_cell, chunk_size=chunk_size,
-                verbose=VerbosityLevels.NONE)
+                gpt_model=gpt_model,
+                head_model=head,
+                layers_per_cell=args.layers_per_cell,
+                chunk_size=chunk_size,
+                verbose=VerbosityLevels.NONE,
+            )
             grad_model.train()
             loss = grad_model(full[:, :-1], tgt, scale_factor=1.0 / K)
             loss.backward()
             losses.append(float(loss.detach().mean().item()))
         optimizer.step()
-        m = {"step": step, "loss": sum(losses) / K,
-             "seq_len": int(full.shape[1]),
-             "step_time_s": round(time.perf_counter() - t0, 2)}
+        m = {
+            "step": step,
+            "loss": sum(losses) / K,
+            "seq_len": int(full.shape[1]),
+            "step_time_s": round(time.perf_counter() - t0, 2),
+        }
         if step % args.eval_every == 0 or step == args.steps:
-            m["eval_acc"] = evaluate(gpt_model, eval_records, tokenizer, prompt_style,
-                                     pad_id, eos_id, args.max_new_tokens, chunk_size, fabric)
+            m["eval_acc"] = evaluate(
+                gpt_model,
+                eval_records,
+                tokenizer,
+                prompt_style,
+                pad_id,
+                eos_id,
+                args.max_new_tokens,
+                chunk_size,
+                fabric,
+            )
         with metrics_path.open("a") as f:
             f.write(json.dumps(m) + "\n")
         line = f"step {step:4d} | loss {m['loss']:.4f} | seq {m['seq_len']} | {m['step_time_s']}s"

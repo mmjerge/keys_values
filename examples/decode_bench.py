@@ -108,26 +108,43 @@ def sync(device):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     p.add_argument("--context-lengths", default="4096,8192,16384,32768")
-    p.add_argument("--caches",
-                   default="dense-default,h2o-torch-quantized8@8192,"
-                           "h2o-torch-quantized8@8192:evict_every=64")
+    p.add_argument(
+        "--caches",
+        default="dense-default,h2o-torch-quantized8@8192,"
+        "h2o-torch-quantized8@8192:evict_every=64",
+    )
     p.add_argument("--new-tokens", type=int, default=256)
-    p.add_argument("--batch", type=int, default=8,
-                   help="Sequences decoded in parallel (= GRPO group size).")
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=8,
+        help="Sequences decoded in parallel (= GRPO group size).",
+    )
     p.add_argument("--chunk-size", type=int, default=1024)
-    p.add_argument("--warmup-tokens", type=int, default=16,
-                   help="Decode steps excluded from timing (kernel warmup).")
-    p.add_argument("--profile", action="store_true",
-                   help="torch.profiler on the decode loop; print top kernels.")
+    p.add_argument(
+        "--warmup-tokens",
+        type=int,
+        default=16,
+        help="Decode steps excluded from timing (kernel warmup).",
+    )
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="torch.profiler on the decode loop; print top kernels.",
+    )
     p.add_argument("--profile-top", type=int, default=15)
-    p.add_argument("--attn", default="flashinfer",
-                   choices=["eager", "flashinfer", "flex"],
-                   help="Attention backend (overridable per config with attn=).")
+    p.add_argument(
+        "--attn",
+        default="flashinfer",
+        choices=["eager", "flashinfer", "flex"],
+        help="Attention backend (overridable per config with attn=).",
+    )
     p.add_argument("--out", default="runs/decode_bench/results.json")
     p.add_argument("--disable-flashinfer", action="store_true")
     p.add_argument("--access-token", default=None)
@@ -139,18 +156,24 @@ def main() -> None:
         args.attn = "eager"
     flashinfer_built = flashinfer_ops._available
     if not flashinfer_built:
-        print("NOTE: FlashInfer extension not built; 'flashinfer' configs run eager",
-              flush=True)
+        print(
+            "NOTE: FlashInfer extension not built; 'flashinfer' configs run eager",
+            flush=True,
+        )
     torch._dynamo.config.cache_size_limit = 32
     torch._dynamo.config.accumulated_cache_size_limit = 128
 
     torch.manual_seed(0)
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
-    fabric = L.Fabric(devices=1, accelerator=args.device,
-                      precision="32-true" if args.device == "cpu" else "bf16-true")
+    fabric = L.Fabric(
+        devices=1,
+        accelerator=args.device,
+        precision="32-true" if args.device == "cpu" else "bf16-true",
+    )
     device = fabric.device
     checkpoint_dir = auto_download_checkpoint(
-        model_name=args.model, access_token=args.access_token)
+        model_name=args.model, access_token=args.access_token
+    )
     check_valid_checkpoint_dir(checkpoint_dir)
     tokenizer = Tokenizer(checkpoint_dir)
     config = Config.from_file(checkpoint_dir / "model_config.yaml")
@@ -166,8 +189,11 @@ def main() -> None:
     specs = [parse_cache_spec(s) for s in args.caches.split(",")]
     results = []
     total_new = args.warmup_tokens + args.new_tokens
-    print(f"{'context':>8} {'cache':<52} {'prefill s':>10} {'decode s':>9} "
-          f"{'tok/s':>8} {'ms/step':>8} {'peak GB':>8}", flush=True)
+    print(
+        f"{'context':>8} {'cache':<52} {'prefill s':>10} {'decode s':>9} "
+        f"{'tok/s':>8} {'ms/step':>8} {'peak GB':>8}",
+        flush=True,
+    )
     for L_ctx in ctx_lens:
         # Random prompt: content does not matter for timing; avoid EOS so no
         # row stops early (all rows must decode the full budget).
@@ -175,8 +201,15 @@ def main() -> None:
         if eos_id is not None:
             prompt[prompt == eos_id] = (eos_id + 1) % vocab
         for name, budget, kwargs in specs:
-            label = name + (f"@{budget}" if budget else "") + (
-                ":" + ";".join(f"{k}={v}" for k, v in kwargs.items()) if kwargs else "")
+            label = (
+                name
+                + (f"@{budget}" if budget else "")
+                + (
+                    ":" + ";".join(f"{k}={v}" for k, v in kwargs.items())
+                    if kwargs
+                    else ""
+                )
+            )
             seq_total = L_ctx + total_new
             if name.startswith("dense"):
                 cache_length = seq_total
@@ -186,8 +219,11 @@ def main() -> None:
             attn = cache_kwargs.pop("attn", args.attn)
             label = f"{label} [{attn}]"
             needs_weights = name.startswith(("h2o", "qh2o"))
-            if name.startswith(("h2o", "qh2o")) and "orig" not in name \
-                    and "grace_period" not in cache_kwargs:
+            if (
+                name.startswith(("h2o", "qh2o"))
+                and "orig" not in name
+                and "grace_period" not in cache_kwargs
+            ):
                 cache_kwargs["grace_period"] = cache_length // 16
             # The caches build their own MultiHeadSelfAttention from
             # cache_kwargs, so the backend selection has to go in here. Select
@@ -201,19 +237,29 @@ def main() -> None:
                 cache_kwargs["flexatt_args"] = FlexAttentionArgs(
                     extend_kv=False,
                     q_lens=choose_q_lens(chunk_size=args.chunk_size, num_q_lens=4),
-                    forward_return_lse=needs_weights)
+                    forward_return_lse=needs_weights,
+                )
             elif attn == "eager":
                 cache_kwargs["use_eager_sdpa_always"] = needs_weights
             deallocate_kv_cache_buffers_of_model(gpt_model)
             try:
-                gpt_model.assign_kv_caches(KVCacheFactory.create(
-                    gpt_model=gpt_model, name=name, max_batch_size=args.batch,
-                    cache_length=cache_length, dtype=dtype,
-                    cache_kwargs=cache_kwargs))
+                gpt_model.assign_kv_caches(
+                    KVCacheFactory.create(
+                        gpt_model=gpt_model,
+                        name=name,
+                        max_batch_size=args.batch,
+                        cache_length=cache_length,
+                        dtype=dtype,
+                        cache_kwargs=cache_kwargs,
+                    )
+                )
                 gpt_model.max_seq_length = seq_total
                 inf = LongContextInferenceModel(
-                    gpt_model, head_model=None, chunk_size=args.chunk_size,
-                    verbose=VerbosityLevels.NONE)
+                    gpt_model,
+                    head_model=None,
+                    chunk_size=args.chunk_size,
+                    verbose=VerbosityLevels.NONE,
+                )
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                     torch.cuda.reset_peak_memory_stats(device)
@@ -226,13 +272,19 @@ def main() -> None:
                 sync(device)
                 t0 = time.perf_counter()
                 generate_completions(
-                    model=inf, prompt_ids=prompt, max_new_tokens=args.warmup_tokens,
-                    temperature=1.0, eos_token_id=None, pad_token_id=0)
+                    model=inf,
+                    prompt_ids=prompt,
+                    max_new_tokens=args.warmup_tokens,
+                    temperature=1.0,
+                    eos_token_id=None,
+                    pad_token_id=0,
+                )
                 sync(device)
                 t_short = time.perf_counter() - t0
                 prof = None
                 if args.profile:
                     from torch.profiler import ProfilerActivity, profile
+
                     acts = [ProfilerActivity.CPU]
                     if device.type == "cuda":
                         acts.append(ProfilerActivity.CUDA)
@@ -241,8 +293,13 @@ def main() -> None:
                 sync(device)
                 t0 = time.perf_counter()
                 comp = generate_completions(
-                    model=inf, prompt_ids=prompt, max_new_tokens=total_new,
-                    temperature=1.0, eos_token_id=None, pad_token_id=0)
+                    model=inf,
+                    prompt_ids=prompt,
+                    max_new_tokens=total_new,
+                    temperature=1.0,
+                    eos_token_id=None,
+                    pad_token_id=0,
+                )
                 sync(device)
                 t_long = time.perf_counter() - t0
                 if prof is not None:
@@ -254,32 +311,61 @@ def main() -> None:
                 t_prefill = t_short - (t_decode / args.new_tokens) * args.warmup_tokens
                 tok_s = args.batch * args.new_tokens / max(t_decode, 1e-9)
                 ms_step = 1000.0 * t_decode / args.new_tokens
-                peak = (torch.cuda.max_memory_allocated(device) / 2**30
-                        if device.type == "cuda" else float("nan"))
-                row = dict(context=L_ctx, cache=label, cache_length=cache_length,
-                           batch=args.batch, new_tokens=args.new_tokens,
-                           prefill_s=t_prefill, decode_s=t_decode, tok_s=tok_s,
-                           ms_per_step=ms_step, peak_gb=peak)
-                print(f"{L_ctx:>8} {label:<52} {t_prefill:>10.2f} {t_decode:>9.2f} "
-                      f"{tok_s:>8.1f} {ms_step:>8.1f} {peak:>8.2f}", flush=True)
+                peak = (
+                    torch.cuda.max_memory_allocated(device) / 2**30
+                    if device.type == "cuda"
+                    else float("nan")
+                )
+                row = dict(
+                    context=L_ctx,
+                    cache=label,
+                    cache_length=cache_length,
+                    batch=args.batch,
+                    new_tokens=args.new_tokens,
+                    prefill_s=t_prefill,
+                    decode_s=t_decode,
+                    tok_s=tok_s,
+                    ms_per_step=ms_step,
+                    peak_gb=peak,
+                )
+                print(
+                    f"{L_ctx:>8} {label:<52} {t_prefill:>10.2f} {t_decode:>9.2f} "
+                    f"{tok_s:>8.1f} {ms_step:>8.1f} {peak:>8.2f}",
+                    flush=True,
+                )
                 if prof is not None:
                     # torch >= 2.x renamed self_cuda_time_total -> self_device_time_total
                     key = "self_cpu_time_total"
                     if device.type == "cuda":
-                        key = next(k for k in ("self_device_time_total", "self_cuda_time_total")
-                                   if hasattr(next(iter(prof.key_averages())), k))
-                    print(prof.key_averages().table(
-                        sort_by=key, row_limit=args.profile_top), flush=True)
+                        key = next(
+                            k
+                            for k in ("self_device_time_total", "self_cuda_time_total")
+                            if hasattr(next(iter(prof.key_averages())), k)
+                        )
+                    print(
+                        prof.key_averages().table(
+                            sort_by=key, row_limit=args.profile_top
+                        ),
+                        flush=True,
+                    )
                     top = []
-                    for ev in sorted(prof.key_averages(),
-                                     key=lambda e: -getattr(e, key)):
-                        top.append(dict(name=ev.key, us=float(getattr(ev, key)),
-                                        count=int(ev.count)))
+                    for ev in sorted(
+                        prof.key_averages(), key=lambda e: -getattr(e, key)
+                    ):
+                        top.append(
+                            dict(
+                                name=ev.key,
+                                us=float(getattr(ev, key)),
+                                count=int(ev.count),
+                            )
+                        )
                         if len(top) >= args.profile_top:
                             break
                     row["profile_top"] = top
                 results.append(row)
-            except torch.cuda.OutOfMemoryError if device.type == "cuda" else MemoryError:
+            except (
+                torch.cuda.OutOfMemoryError if device.type == "cuda" else MemoryError
+            ):
                 print(f"{L_ctx:>8} {label:<52} {'OOM':>10}", flush=True)
                 results.append(dict(context=L_ctx, cache=label, oom=True))
             # Release everything from this config before the next one. The

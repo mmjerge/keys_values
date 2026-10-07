@@ -58,10 +58,7 @@ from litgpt.utils import (
 
 from keys_values.config import Config
 from keys_values.data.constants import LIT_MODEL_FNAME
-from keys_values.kvcache.factory import (
-    KVCacheFactory,
-    deallocate_kv_cache_buffers_of_model,
-)
+from keys_values.kvcache.factory import KVCacheFactory
 from keys_values.long_context import LongContextInferenceModel
 from keys_values.lora import (
     GPT as GPTLoRA,
@@ -110,8 +107,9 @@ def primary_score(eval_fn, metric: str, prediction: str, record: dict) -> float:
         return 0.0
 
 
-def shaped_score(eval_fn, metric: str, prediction: str, record: dict,
-                 format_bonus: float) -> float:
+def shaped_score(
+    eval_fn, metric: str, prediction: str, record: dict, format_bonus: float
+) -> float:
     """Training reward: primary metric plus a small format bonus.
 
     Sampled rollouts at temperature 1.0 almost never hit the strict output
@@ -127,8 +125,9 @@ def shaped_score(eval_fn, metric: str, prediction: str, record: dict,
     return primary + format_bonus * fmt
 
 
-def score_components(eval_fn, metric: str, prediction: str,
-                     record: dict) -> tuple[float, float]:
+def score_components(
+    eval_fn, metric: str, prediction: str, record: dict
+) -> tuple[float, float]:
     """(primary metric, format adherence) for one completion, 0.0 on error.
 
     Logged separately per step: the shaped reward alone cannot distinguish
@@ -139,8 +138,10 @@ def score_components(eval_fn, metric: str, prediction: str,
     """
     try:
         metrics, _ = eval_fn(prediction, record)
-        return (float(metrics.get(metric, 0.0)),
-                float(metrics.get("extraction_rate", 0.0)))
+        return (
+            float(metrics.get(metric, 0.0)),
+            float(metrics.get("extraction_rate", 0.0)),
+        )
     except Exception:
         return 0.0, 0.0
 
@@ -156,60 +157,106 @@ def main() -> None:
     p.add_argument("--group-size", type=int, default=4)
     p.add_argument("--prompts-per-update", type=int, default=2)
     p.add_argument("--adv-mode", choices=["grpo", "rloo"], default="rloo")
-    p.add_argument("--max-new-tokens", type=int, default=2600,
-                   help="Output budget; the _2k tiers need ~2200 tokens.")
+    p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=2600,
+        help="Output budget; the _2k tiers need ~2200 tokens.",
+    )
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--lr", type=float, default=5e-6)
-    p.add_argument("--optimizer", choices=["adamw", "paged_adamw8bit"],
-                   default="paged_adamw8bit")
+    p.add_argument(
+        "--optimizer", choices=["adamw", "paged_adamw8bit"], default="paged_adamw8bit"
+    )
     p.add_argument("--chunk-size", type=int, default=1024)
-    p.add_argument("--attn", default="auto", choices=ATTN_BACKENDS,
-                   help="Attention backend: auto = FlashInfer if built, else eager "
-                        "with a loud warning (Flex recompiles per kv_len in decode); "
-                        "flex (gradient-pass experiments); eager (baseline).")
-    p.add_argument("--backward-tmp-gb", type=float, default=2.0,
-                   help="Limit (GiB) for temporary device arrays in the "
-                        "chunked backward (0 disables). Needed at 32k+.")
-    p.add_argument("--lora-r", type=int, default=0,
-                   help="LoRA rank (0 = full fine-tuning). Adapters on "
-                        "q/k/v/proj/mlp, alpha=2r. Applies to sparse and "
-                        "dense arms alike.")
-    p.add_argument("--save-intermediate", action="store_true",
-                   help="Also save a full state_dict at every eval step "
-                        "(15 GB each for 7B). Off by default: this filled "
-                        "worker disks. final.pt is always written.")
-    p.add_argument("--dense-baseline", action="store_true",
-                   help="Dense-RL baseline: compute the gradient with one "
-                        "full-sequence backward instead of the memory-bounded "
-                        "chunked path. Same loss and gradients (see "
-                        "test_dense_baseline_matches_chunked_gradient); much "
-                        "higher peak memory. Use for paper baselines.")
-    p.add_argument("--truncate-prompt", type=int, default=0,
-                   help="Prompt token budget (0 = off), applied in training "
-                        "AND evaluation. Instruction-preserving: keeps the "
-                        "head and tail of the prompt and cuts the document "
-                        "in the middle. For the dense-truncated baseline.")
+    p.add_argument(
+        "--attn",
+        default="auto",
+        choices=ATTN_BACKENDS,
+        help="Attention backend: auto = FlashInfer if built, else eager "
+        "with a loud warning (Flex recompiles per kv_len in decode); "
+        "flex (gradient-pass experiments); eager (baseline).",
+    )
+    p.add_argument(
+        "--backward-tmp-gb",
+        type=float,
+        default=2.0,
+        help="Limit (GiB) for temporary device arrays in the "
+        "chunked backward (0 disables). Needed at 32k+.",
+    )
+    p.add_argument(
+        "--lora-r",
+        type=int,
+        default=0,
+        help="LoRA rank (0 = full fine-tuning). Adapters on "
+        "q/k/v/proj/mlp, alpha=2r. Applies to sparse and "
+        "dense arms alike.",
+    )
+    p.add_argument(
+        "--save-intermediate",
+        action="store_true",
+        help="Also save a full state_dict at every eval step "
+        "(15 GB each for 7B). Off by default: this filled "
+        "worker disks. final.pt is always written.",
+    )
+    p.add_argument(
+        "--dense-baseline",
+        action="store_true",
+        help="Dense-RL baseline: compute the gradient with one "
+        "full-sequence backward instead of the memory-bounded "
+        "chunked path. Same loss and gradients (see "
+        "test_dense_baseline_matches_chunked_gradient); much "
+        "higher peak memory. Use for paper baselines.",
+    )
+    p.add_argument(
+        "--truncate-prompt",
+        type=int,
+        default=0,
+        help="Prompt token budget (0 = off), applied in training "
+        "AND evaluation. Instruction-preserving: keeps the "
+        "head and tail of the prompt and cuts the document "
+        "in the middle. For the dense-truncated baseline.",
+    )
     p.add_argument("--layers-per-cell", type=int, default=1)
-    p.add_argument("--evict-every", type=int, default=1,
-                   help="Block eviction for H2O caches: rank slots once per "
-                        "B decoded tokens instead of every token (1 = off).")
-    p.add_argument("--temperature", type=float, default=0.7,
-                   help="Rollout sampling temperature. Long structured outputs "
-                        "derail badly at 1.0 (zero parseable rollouts observed).")
-    p.add_argument("--format-bonus", type=float, default=0.2,
-                   help="Training-reward bonus per unit of format adherence "
-                        "(extraction_rate); 0 disables shaping.")
-    p.add_argument("--format-gate", type=float, default=0.5,
-                   help="Pay the format bonus only while the fraction of "
-                        "parseable rollouts in the group is below this. "
-                        ">= 1.0 disables the gate (old always-on bonus, which "
-                        "the policy locked onto: countdown 0.125 -> 0.0).")
+    p.add_argument(
+        "--evict-every",
+        type=int,
+        default=1,
+        help="Block eviction for H2O caches: rank slots once per "
+        "B decoded tokens instead of every token (1 = off).",
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Rollout sampling temperature. Long structured outputs "
+        "derail badly at 1.0 (zero parseable rollouts observed).",
+    )
+    p.add_argument(
+        "--format-bonus",
+        type=float,
+        default=0.2,
+        help="Training-reward bonus per unit of format adherence "
+        "(extraction_rate); 0 disables shaping.",
+    )
+    p.add_argument(
+        "--format-gate",
+        type=float,
+        default=0.5,
+        help="Pay the format bonus only while the fraction of "
+        "parseable rollouts in the group is below this. "
+        ">= 1.0 disables the gate (old always-on bonus, which "
+        "the policy locked onto: countdown 0.125 -> 0.0).",
+    )
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--n-eval", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/grpo_longproc")
-    p.add_argument("--eval-only", action="store_true",
-                   help="Base-model probe: score n-eval records, no training.")
+    p.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Base-model probe: score n-eval records, no training.",
+    )
     p.add_argument("--disable-flashinfer", action="store_true")
     p.add_argument("--access-token", default=None)
     args = p.parse_args()
@@ -222,13 +269,17 @@ def main() -> None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
-    fabric = L.Fabric(devices=1, accelerator=args.device,
-                      precision="32-true" if args.device == "cpu" else "bf16-true")
+    fabric = L.Fabric(
+        devices=1,
+        accelerator=args.device,
+        precision="32-true" if args.device == "cpu" else "bf16-true",
+    )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_dir = auto_download_checkpoint(
-        model_name=args.model, access_token=args.access_token)
+        model_name=args.model, access_token=args.access_token
+    )
     tokenizer = Tokenizer(checkpoint_dir)
     if args.lora_r > 0:
         # LoRA variant (same pattern as finetune_long_lora). Applied to BOTH
@@ -237,14 +288,23 @@ def main() -> None:
         # not (optimizer state and gradients shrink to the adapter).
         config = ConfigLoRA.from_file(
             checkpoint_dir / "model_config.yaml",
-            lora_r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.0,
-            lora_query=True, lora_key=True, lora_value=True,
-            lora_projection=True, lora_mlp=True, lora_head=False)
+            lora_r=args.lora_r,
+            lora_alpha=2 * args.lora_r,
+            lora_dropout=0.0,
+            lora_query=True,
+            lora_key=True,
+            lora_value=True,
+            lora_projection=True,
+            lora_mlp=True,
+            lora_head=False,
+        )
     else:
         config = Config.from_file(checkpoint_dir / "model_config.yaml")
-    prompt_style = (load_prompt_style(checkpoint_dir)
-                    if has_prompt_style(checkpoint_dir)
-                    else PromptStyle.from_config(config))
+    prompt_style = (
+        load_prompt_style(checkpoint_dir)
+        if has_prompt_style(checkpoint_dir)
+        else PromptStyle.from_config(config)
+    )
     pad_id = tokenizer.processor.token_to_id("<|endoftext|>")
     if pad_id is None:
         pad_id = int(tokenizer.eos_id) if tokenizer.eos_id is not None else 0
@@ -257,41 +317,64 @@ def main() -> None:
     rng.shuffle(idx)
     eval_idx = set(idx[: args.n_eval])
     eval_records = [records[i] for i in sorted(eval_idx)]
-    train_records = [records[i] for i in idx[args.n_eval:]]
-    print(f"{args.dataset}: {len(records)} records -> "
-          f"{len(train_records)} train / {len(eval_records)} eval; "
-          f"reward metric = {metric}")
+    train_records = [records[i] for i in idx[args.n_eval :]]
+    print(
+        f"{args.dataset}: {len(records)} records -> "
+        f"{len(train_records)} train / {len(eval_records)} eval; "
+        f"reward metric = {metric}"
+    )
 
     check_valid_checkpoint_dir(checkpoint_dir)
     # Attention backend. Must reach both the model and the caches (the caches
     # build their own MHA, and the gradient cells reuse kv_cache.mha).
     mha_kwargs = attention_mha_kwargs(
-        backend="eager" if args.disable_flashinfer and args.attn == "auto" else args.attn,
-        kv_cache_name=args.kv_cache_name, chunk_size=args.chunk_size,
-        device=fabric.device)
+        backend=(
+            "eager" if args.disable_flashinfer and args.attn == "auto" else args.attn
+        ),
+        kv_cache_name=args.kv_cache_name,
+        chunk_size=args.chunk_size,
+        device=fabric.device,
+    )
     with fabric.init_module(empty_init=True):
-        gpt_model = GPTLoRA(config, **mha_kwargs) if args.lora_r > 0 else GPT(config, **mha_kwargs)
-    load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME,
-                    strict=(args.lora_r == 0))
+        gpt_model = (
+            GPTLoRA(config, **mha_kwargs)
+            if args.lora_r > 0
+            else GPT(config, **mha_kwargs)
+        )
+    load_checkpoint(
+        fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME, strict=(args.lora_r == 0)
+    )
     if args.lora_r > 0:
         mark_only_lora_as_trainable(gpt_model)
         n_train = sum(p.numel() for p in gpt_model.parameters() if p.requires_grad)
-        print(f"LoRA r={args.lora_r}: {n_train / 1e6:.1f}M trainable params", flush=True)
+        print(
+            f"LoRA r={args.lora_r}: {n_train / 1e6:.1f}M trainable params", flush=True
+        )
     gpt_model.to(fabric.device)
 
     cache_kwargs = dict(mha_kwargs)
-    if args.kv_cache_name.startswith(("h2o", "qh2o")) and "orig" not in args.kv_cache_name:
+    if (
+        args.kv_cache_name.startswith(("h2o", "qh2o"))
+        and "orig" not in args.kv_cache_name
+    ):
         cache_kwargs["grace_period"] = args.cache_length // 16
     if args.evict_every > 1:
         cache_kwargs["evict_every"] = args.evict_every
-    gpt_model.assign_kv_caches(KVCacheFactory.create(
-        gpt_model=gpt_model, name=args.kv_cache_name,
-        max_batch_size=args.group_size, cache_length=args.cache_length,
-        dtype=dtype, cache_kwargs=cache_kwargs))
+    gpt_model.assign_kv_caches(
+        KVCacheFactory.create(
+            gpt_model=gpt_model,
+            name=args.kv_cache_name,
+            max_batch_size=args.group_size,
+            cache_length=args.cache_length,
+            dtype=dtype,
+            cache_kwargs=cache_kwargs,
+        )
+    )
 
     def encode(rec):
         ids = tokenizer.encode(
-            prompt_style.apply(rec["input_prompt"]), device=fabric.device)
+            prompt_style.apply(rec["input_prompt"]), device=fabric.device
+        )
         return truncate_prompt(ids, args.truncate_prompt)
 
     def truncate_prompt(ids: torch.Tensor, budget: int) -> torch.Tensor:
@@ -309,7 +392,7 @@ def main() -> None:
         if budget <= 0 or ids.shape[-1] <= budget:
             return ids
         head_n = budget // 4
-        return torch.cat((ids[:head_n], ids[-(budget - head_n):]), dim=-1)
+        return torch.cat((ids[:head_n], ids[-(budget - head_n) :]), dim=-1)
 
     @torch.no_grad()
     def eval_model(tag: str) -> float:
@@ -319,12 +402,22 @@ def main() -> None:
             ids = encode(rec).unsqueeze(0)
             gpt_model.max_seq_length = int(ids.shape[1]) + args.max_new_tokens
             inf = LongContextInferenceModel(
-                gpt_model, head_model=None, chunk_size=args.chunk_size,
-                verbose=VerbosityLevels.NONE)
+                gpt_model,
+                head_model=None,
+                chunk_size=args.chunk_size,
+                verbose=VerbosityLevels.NONE,
+            )
             comp = generate_completions(
-                model=inf, prompt_ids=ids, max_new_tokens=args.max_new_tokens,
-                temperature=1.0, top_k=1, top_p=1.0, eos_token_id=eos_id,
-                pad_token_id=pad_id, no_inference_mode=True)
+                model=inf,
+                prompt_ids=ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=1.0,
+                top_k=1,
+                top_p=1.0,
+                eos_token_id=eos_id,
+                pad_token_id=pad_id,
+                no_inference_mode=True,
+            )
             text = tokenizer.decode(comp[0][comp[0] != pad_id])
             scores.append(primary_score(eval_fn, metric, text, rec))
         mean = sum(scores) / max(len(scores), 1)
@@ -340,6 +433,7 @@ def main() -> None:
         optimizer = torch.optim.AdamW(trainable, lr=args.lr)
     else:
         import bitsandbytes as bnb
+
         optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=args.lr)
 
     eval_model("step 0")
@@ -348,11 +442,12 @@ def main() -> None:
         t0 = time.perf_counter()
         micro_metrics = []
         step_primary: list[float] = []  # unshaped task metric per rollout
-        step_format: list[float] = []   # format adherence per rollout
-        step_spread: list[float] = []   # 1.0 per group with non-identical rewards
+        step_format: list[float] = []  # format adherence per rollout
+        step_spread: list[float] = []  # 1.0 per group with non-identical rewards
         for micro in range(args.prompts_per_update):
-            rec = train_records[(step * args.prompts_per_update + micro)
-                                % len(train_records)]
+            rec = train_records[
+                (step * args.prompts_per_update + micro) % len(train_records)
+            ]
             prompt_ids = encode(rec).unsqueeze(0)  # truncation (if any) inside
 
             def reward_fn(p_ids, completion_ids):
@@ -381,39 +476,56 @@ def main() -> None:
                 step_spread.append(1.0 if max(vals) - min(vals) > 1e-9 else 0.0)
                 return torch.tensor(vals, dtype=torch.float32)
 
-            micro_metrics.append(grpo_step(
-                gpt_model=gpt_model, prompt_ids=prompt_ids, reward_fn=reward_fn,
-                optimizer=optimizer, group_size=args.group_size,
-                max_new_tokens=args.max_new_tokens, chunk_size=args.chunk_size,
-                layers_per_cell=args.layers_per_cell,
-                temperature=args.temperature, eos_token_id=eos_id,
-                pad_token_id=pad_id, advantage_mode=args.adv_mode,
-                zero_grad=(micro == 0),
-                optimizer_step=(micro == args.prompts_per_update - 1),
-                grad_scale=1.0 / args.prompts_per_update,
-                backward_tmp_gb=args.backward_tmp_gb,
-                dense_baseline=args.dense_baseline,
-            ))
+            micro_metrics.append(
+                grpo_step(
+                    gpt_model=gpt_model,
+                    prompt_ids=prompt_ids,
+                    reward_fn=reward_fn,
+                    optimizer=optimizer,
+                    group_size=args.group_size,
+                    max_new_tokens=args.max_new_tokens,
+                    chunk_size=args.chunk_size,
+                    layers_per_cell=args.layers_per_cell,
+                    temperature=args.temperature,
+                    eos_token_id=eos_id,
+                    pad_token_id=pad_id,
+                    advantage_mode=args.adv_mode,
+                    zero_grad=(micro == 0),
+                    optimizer_step=(micro == args.prompts_per_update - 1),
+                    grad_scale=1.0 / args.prompts_per_update,
+                    backward_tmp_gb=args.backward_tmp_gb,
+                    dense_baseline=args.dense_baseline,
+                )
+            )
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
         dt = time.perf_counter() - t0
         n_roll = max(len(step_primary), 1)
         mean_primary = sum(step_primary) / n_roll
         mean_format = sum(step_format) / n_roll
         frac_spread = sum(step_spread) / max(len(step_spread), 1)
-        entry = {"step": step, "reward": mean_r, "primary": mean_primary,
-                 "format": mean_format, "spread": frac_spread, "sec": dt}
-        mem_msg = (f" | primary {mean_primary:.3f} fmt {mean_format:.2f}"
-                   f" spread {frac_spread:.2f}")
+        entry = {
+            "step": step,
+            "reward": mean_r,
+            "primary": mean_primary,
+            "format": mean_format,
+            "spread": frac_spread,
+            "sec": dt,
+        }
+        mem_msg = (
+            f" | primary {mean_primary:.3f} fmt {mean_format:.2f}"
+            f" spread {frac_spread:.2f}"
+        )
         for key in ("grad_peak_device_mib", "parked_peak_mib", "parked_peak_count"):
             if key in micro_metrics[0]:
                 entry[key] = max(m[key] for m in micro_metrics)
         if "grad_peak_device_mib" in entry:
             mem_msg += f" | dev peak {entry['grad_peak_device_mib'] / 1024:.1f}G"
         if "parked_peak_mib" in entry:
-            mem_msg += (f" | parked {entry['parked_peak_mib']:.0f}MiB"
-                        f"/{int(entry['parked_peak_count'])}")
-        print(f"step {step:4d} | reward {mean_r:.3f} | {dt:.1f}s{mem_msg}",
-              flush=True)
+            mem_msg += (
+                f" | parked {entry['parked_peak_mib']:.0f}MiB"
+                f"/{int(entry['parked_peak_count'])}"
+            )
+        print(f"step {step:4d} | reward {mean_r:.3f} | {dt:.1f}s{mem_msg}", flush=True)
         history.append(entry)
         if step % args.eval_every == 0:
             score = eval_model(f"step {step}")

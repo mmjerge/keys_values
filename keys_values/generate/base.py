@@ -38,7 +38,10 @@ from litgpt.utils import (
 )
 
 from keys_values.config import Config
-from keys_values.data.constants import LIT_MODEL_FNAME
+from keys_values.data.constants import (
+    LIT_MODEL_FNAME,
+)
+from keys_values.constants import DEFAULT_IGNORE_INDEX
 from keys_values.kvcache.factory import (
     deallocate_kv_cache_buffers_of_model,
     KVCacheFactory,
@@ -221,7 +224,7 @@ def batched_generate_fn(
     prompts: torch.Tensor,
     max_returned_tokens: int,
     *,
-    ignore_index: int = -100,
+    ignore_index: int = DEFAULT_IGNORE_INDEX,
     sample_args: Union[list[dict], dict],
     stop_tokens: Tuple[List[int], ...] = (),
     deallocate_cache_buffers: bool = True,
@@ -390,9 +393,9 @@ def _batched_generate_impl(
                     seq_pos = int(seq_pos > 0 and int_token == seq[0])
                 stop_progresses[batch_idx][seq_idx] = seq_pos
 
-        token_out = torch.where(
-            stopped_mask, ignore_ind_vec, tokens.flatten()
-        ).view(-1, 1)
+        token_out = torch.where(stopped_mask, ignore_ind_vec, tokens.flatten()).view(
+            -1, 1
+        )
         if return_logprobs:
             # `stopped_mask` reflects rows that stopped in a *previous* step,
             # so `~stopped_mask` marks the tokens generated at this step (the
