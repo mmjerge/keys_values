@@ -8,7 +8,7 @@
 #       | q8h2o<K> same with int8 KV (slower decode, smaller)
 #       | dense    dense-default cache sized to prompt + generation
 #
-# Env knobs: KV_MAXNEW (16384), KV_STEPS (200), KV_GROUP (8), KV_EVAL_SETS
+# Env knobs: KV_MAXNEW (16384), KV_STEPS (200), KV_LR (1e-6), KV_GROUP (8), KV_EVAL_SETS
 # (math500,aime24,aime25,amc23), KV_N_EVAL (0 = full sets), KV_EVAL_SAMPLES
 # (1), KV_TRAIN (deepscaler), KV_BRANCH (rl-longproc), KV_EXTRA (appended).
 #
@@ -28,6 +28,7 @@ REGION="us-east-2"
 BRANCH="${KV_BRANCH:-rl-longproc}"
 MAXNEW="${KV_MAXNEW:-16384}"
 STEPS="${KV_STEPS:-200}"
+LR="${KV_LR:-1e-6}"
 GROUP="${KV_GROUP:-8}"
 EVAL_SETS="${KV_EVAL_SETS:-math500,aime24,aime25,amc23}"
 N_EVAL="${KV_N_EVAL:-0}"
@@ -52,7 +53,7 @@ for seed in ${SEEDS//,/ }; do
   else
     NAME="${PREFIX}_train_${MTAG}_${ARM}_${TRAIN}_s${seed}"
     RUN_ARGS="--train-dataset ${TRAIN} --steps ${STEPS} --group-size ${GROUP} \\
-    --prompts-per-update 2 --adv-mode grpo --lr 1e-6 --optimizer paged_adamw8bit \\
+    --prompts-per-update 2 --adv-mode grpo --lr ${LR} --optimizer paged_adamw8bit \\
     --eval-sets ${EVAL_SETS} --n-eval ${N_EVAL} --eval-samples ${EVAL_SAMPLES} \\
     --eval-every 50 --seed ${seed}"
   fi
