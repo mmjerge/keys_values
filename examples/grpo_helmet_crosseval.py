@@ -50,6 +50,7 @@ from keys_values.data.constants import LIT_MODEL_FNAME
 from keys_values.data.load_helmet_dev_eval import load_helmet_dev_eval
 from keys_values.evaluation.metrics import rouge_n_f1, sub_exact_match
 from keys_values.kvcache.factory import KVCacheFactory, deallocate_kv_cache_buffers_of_model
+from keys_values.kvcache.pos_compact import set_position_compaction
 from keys_values.long_context import LongContextInferenceModel
 from keys_values.model import GPT
 from keys_values.rl.grpo.rollout import generate_completions
@@ -98,6 +99,10 @@ def main() -> None:
     p.add_argument("--chunk-size", type=int, default=1024)
     p.add_argument("--n-eval", type=int, default=100)
     p.add_argument("--out", default=None)
+    p.add_argument("--compact-positions", action="store_true",
+                   help="Add a third eval arm: the H2O cache with retained "
+                        "tokens re-expressed at compacted RoPE positions "
+                        "(A/B for the sparse-inference accuracy gap).")
     p.add_argument("--disable-flashinfer", action="store_true")
     p.add_argument("--access-token", default=None)
     args = p.parse_args()
@@ -154,9 +159,13 @@ def main() -> None:
     base_sd = {k: v.detach().cpu().clone() for k, v in gpt_model.state_dict().items()}
 
     eval_caches = [
-        ("dense", "dense-default", max_len + args.max_new_tokens + 8),
-        ("h2o", "h2o-torch-quantized8", args.h2o_cache_length),
+        ("dense", "dense-default", max_len + args.max_new_tokens + 8, False),
+        ("h2o", "h2o-torch-quantized8", args.h2o_cache_length, False),
     ]
+    if args.compact_positions:
+        eval_caches.append(
+            ("h2o+compact", "h2o-torch-quantized8", args.h2o_cache_length, True)
+        )
 
     results = {}
     hdr = f"{'checkpoint':>12} {'eval-cache':>10} | {'EM':>6} {'F1':>6}"
@@ -168,12 +177,13 @@ def main() -> None:
             name, path = entry.split("=", 1)
             sd = torch.load(path, map_location="cpu", weights_only=True)
         gpt_model.load_state_dict(sd, strict=True)
-        for cache_tag, cache_name, cl in eval_caches:
+        for cache_tag, cache_name, cl, compact in eval_caches:
             deallocate_kv_cache_buffers_of_model(gpt_model)
             ckw = {"grace_period": cl // 16} if cache_name.startswith("h2o") else {}
             gpt_model.assign_kv_caches(KVCacheFactory.create(
                 gpt_model=gpt_model, name=cache_name, max_batch_size=1,
                 cache_length=cl, dtype=dtype, cache_kwargs=ckw))
+            set_position_compaction(gpt_model, compact)
             em, f1 = eval_records(gpt_model, records, tokenizer, prompt_style,
                                   pad_id, eos_id, args.max_new_tokens,
                                   args.chunk_size, fabric)
