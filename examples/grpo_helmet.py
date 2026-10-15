@@ -42,16 +42,16 @@ import random
 import time
 from pathlib import Path
 
-import lightning as L
 import torch
 from litgpt.prompts import PromptStyle, has_prompt_style, load_prompt_style
 from litgpt.tokenizer import Tokenizer
 from litgpt.utils import (
     auto_download_checkpoint,
     check_valid_checkpoint_dir,
-    load_checkpoint,
 )
 
+from keys_values.finetune.utils import load_checkpoint
+from keys_values.rl.runtime import SingleDevice
 from keys_values.config import Config
 from keys_values.data.constants import LIT_MODEL_FNAME
 from keys_values.data.load_helmet_dev_eval import load_helmet_dev_eval
@@ -234,11 +234,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.jsonl"
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
-    fabric = L.Fabric(
-        devices=1,
-        accelerator=args.device,
-        precision="32-true" if args.device == "cpu" else "bf16-true",
-    )
+    fabric = SingleDevice.create(args.device)
 
     checkpoint_dir = auto_download_checkpoint(
         model_name=args.model, access_token=args.access_token
@@ -293,7 +289,7 @@ def main() -> None:
     )
     with fabric.init_module(empty_init=True):
         gpt_model = GPT(config, **mha_kwargs)
-    load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
+    load_checkpoint(gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
     gpt_model.to(fabric.device)
     # Application-level cache tuning (factory defaults stay simple upstream):
     # for H2O-family caches, protect the recently read tail -- question-at-the-

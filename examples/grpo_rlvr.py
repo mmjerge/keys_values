@@ -50,7 +50,6 @@ import re
 import time
 from pathlib import Path
 
-import lightning as L
 import torch
 from datasets import load_dataset
 from litgpt.prompts import PromptStyle, has_prompt_style, load_prompt_style
@@ -58,9 +57,10 @@ from litgpt.tokenizer import Tokenizer
 from litgpt.utils import (
     auto_download_checkpoint,
     check_valid_checkpoint_dir,
-    load_checkpoint,
 )
 
+from keys_values.finetune.utils import load_checkpoint
+from keys_values.rl.runtime import SingleDevice
 from keys_values.config import Config
 from keys_values.data.constants import LIT_MODEL_FNAME
 from keys_values.kvcache.factory import KVCacheFactory
@@ -352,11 +352,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
-    fabric = L.Fabric(
-        devices=1,
-        accelerator=args.device,
-        precision="32-true" if args.device == "cpu" else "bf16-true",
-    )
+    fabric = SingleDevice.create(args.device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(
@@ -429,7 +425,7 @@ def main() -> None:
             else GPT(config, **mha_kwargs)
         )
     load_checkpoint(
-        fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME, strict=(args.lora_r == 0)
+        gpt_model, checkpoint_dir / LIT_MODEL_FNAME, strict=(args.lora_r == 0)
     )
     if args.lora_r > 0:
         mark_only_lora_as_trainable(gpt_model)
