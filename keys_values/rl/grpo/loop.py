@@ -238,7 +238,9 @@ def _dense_baseline_backward(
     finally:
         for block, fwd in zip(blocks, orig_forwards):
             block.forward = fwd
-        head.set_batch(advantages=advantages_all, old_logps=old_logps_all, mask=mask_all)
+        head.set_batch(
+            advantages=advantages_all, old_logps=old_logps_all, mask=mask_all
+        )
         gpt_model.assign_kv_caches(kv_caches)
     return loss
 
@@ -398,6 +400,7 @@ def grpo_step(
         gpt_model.config,
         epsilon_low=epsilon_low,
         epsilon_high=epsilon_high,
+        temperature=temperature,
     )
     head.set_batch(advantages=advantages, old_logps=old_logps, mask=mask)
     # With the new training replay cache, "ext-*" annotations match twice;
@@ -477,7 +480,9 @@ def grpo_step(
         # Quantify the rollout (decode) vs. training-forward log-prob skew over
         # real completion tokens -- a measure of the train/inference gap.
         with torch.no_grad():
-            skew = ((gen_logps - old_logps).abs() * mask).sum() / mask.sum().clamp_min(1.0)
+            skew = ((gen_logps - old_logps).abs() * mask).sum() / mask.sum().clamp_min(
+                1.0
+            )
         metrics["logp_skew_decode_vs_forward"] = float(skew.item())
     if profile:
         metrics.update(times)

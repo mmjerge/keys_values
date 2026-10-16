@@ -533,7 +533,7 @@ def main() -> None:
         step_spread: list[float] = []
         for micro in range(args.prompts_per_update):
             rec = train_records[
-                (step * args.prompts_per_update + micro) % len(train_records)
+                ((step - 1) * args.prompts_per_update + micro) % len(train_records)
             ]
             prompt_ids = encode(rec).unsqueeze(0)
 
