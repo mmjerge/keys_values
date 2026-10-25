@@ -327,6 +327,12 @@ def main() -> None:
     p.add_argument("--out-dir", default="runs/grpo_rlvr")
     p.add_argument("--eval-only", action="store_true")
     p.add_argument(
+        "--skip-initial-eval",
+        action="store_true",
+        help="Skip the step-0 eval (reuse an earlier base eval of the "
+        "same model/cache/cutoff; saves 15-30 h at 32k).",
+    )
+    p.add_argument(
         "--checkpoint",
         default=None,
         help="state_dict (final.pt) to load before evaluating; with "
@@ -525,7 +531,9 @@ def main() -> None:
 
         optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=args.lr)
 
-    history = [{"step": 0, "eval": eval_model("step 0")}]
+    history = (
+        [] if args.skip_initial_eval else [{"step": 0, "eval": eval_model("step 0")}]
+    )
     for step in range(1, args.steps + 1):
         t0 = time.perf_counter()
         micro_metrics = []
