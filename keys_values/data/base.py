@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Union, Callable, Tuple
 
 import torch
@@ -18,7 +19,11 @@ from torch.utils.data import Dataset
 
 from litgpt import Tokenizer, PromptStyle
 
-from keys_values.data.constants import POSITION_NAME, INPUT_IDS_NAME
+from keys_values.data.constants import (
+    POSITION_NAME,
+    INPUT_IDS_NAME,
+)
+from keys_values.constants import DEFAULT_PAD_ID
 
 
 class LongContextDataset(Dataset):
@@ -77,7 +82,7 @@ def pad_dataset(
 
 def common_collate_fn(
     samples: List[Dict[str, Any]],
-    pad_id: int = 0,
+    pad_id: int = DEFAULT_PAD_ID,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     # Batch can contain padding entries
     _samples = samples
@@ -104,3 +109,23 @@ def common_collate_fn(
             for name in names
         },
     }, samples
+
+
+@dataclass(frozen=True)
+class DataModuleEncoding:
+    name: str
+    kwargs: Dict[str, Any]
+
+
+class EncodableDataModuleMixin:
+    """
+    Subclasses are data modules which can be encoded into a dictionary of
+    simple types. This is used when spawning processes.
+
+    Note: In general, data modules can be encoded and decoded only before
+    their `connect` method has been called.
+
+    """
+
+    def encode(self) -> DataModuleEncoding:
+        raise NotImplementedError()

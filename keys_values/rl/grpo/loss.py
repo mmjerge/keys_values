@@ -72,11 +72,19 @@ class GRPOLossHeadModel(HeadModel):
         config: Config,
         epsilon_low: float = 0.2,
         epsilon_high: float = 0.2,
+        temperature: float = 1.0,
     ):
         super().__init__()
         self._vocab_size = config.padded_vocab_size
         self.epsilon_low = epsilon_low
         self.epsilon_high = epsilon_high
+        if temperature <= 0:
+            raise ValueError(f"temperature={temperature}, must be positive")
+        # The rollout samples from softmax(logits / temperature) and records
+        # log-probs under that distribution (rollout.sampled_token_logprobs).
+        # The policy log-prob here must use the same scaling, or the ratio
+        # old/new compares two different distributions whenever T != 1.
+        self.temperature = temperature
         self._old_logps: Optional[torch.Tensor] = None
         self._advantages: Optional[torch.Tensor] = None
         self._mask: Optional[torch.Tensor] = None
@@ -145,7 +153,9 @@ class GRPOLossHeadModel(HeadModel):
         logits = model_outputs[:, diff:, :]
         num = targets.shape[1]
 
-        log_probs = F.log_softmax(logits, dim=-1)
+        # fp32 for the loss-side softmax: bf16 logits lose precision in the
+        # log-sum-exp over a 150k vocabulary.
+        log_probs = F.log_softmax(logits.float() / self.temperature, dim=-1)
         policy_logp = torch.gather(
             log_probs, dim=-1, index=targets.unsqueeze(-1)
         ).squeeze(-1)
@@ -192,4 +202,5 @@ class GRPOLossHeadModel(HeadModel):
             config,
             epsilon_low=self.epsilon_low,
             epsilon_high=self.epsilon_high,
+            temperature=self.temperature,
         )

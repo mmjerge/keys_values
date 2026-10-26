@@ -32,6 +32,24 @@ pip install -q -r scripts/requirements-worker.txt
 pip install -q -e .
 pip install -q awscli
 
+# FlashInfer CUDA extension: the H2O decode path needs attention weights, and
+# without this it falls back to eager SDPA (far slower). build_ext.py targets
+# sm_80/sm_90; add the host GPU's arch (L40S = 8.9) so the kernels are native.
+echo "=== [2b/5] FlashInfer extension ==="
+if ! python -c "import torch, keys_values._flashinfer_ops" 2>/dev/null; then
+    pip install -q flashinfer-python
+    CC_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+    unset LD_LIBRARY_PATH
+    export PATH=/usr/local/cuda/bin:$PATH
+    # build_ext.py locates csrc/ relative to itself, so patch in place and restore.
+    sed -i "s/-gencode=arch=compute_90,code=sm_90/-gencode=arch=compute_${CC_ARCH},code=sm_${CC_ARCH}/" build_ext.py
+    python build_ext.py > "$HOME/flashinfer_build.log" 2>&1 \
+        && python -c "import torch, keys_values._flashinfer_ops; print('flashinfer OK')" \
+        || echo "flashinfer build FAILED, see ~/flashinfer_build.log"
+    git checkout -q build_ext.py
+    # The .so is gitignored, so the per-job 'git clean -fd' in worker_loop.sh keeps it.
+fi
+
 echo "=== [3/5] canonical HELMET splits from S3 ==="
 mkdir -p "$HOME/.cache/huggingface/helmet/longtrain"
 aws s3 sync s3://keys-values-helmet-canonical/longtrain/ \

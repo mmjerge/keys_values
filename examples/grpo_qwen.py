@@ -74,16 +74,16 @@ from __future__ import annotations
 import argparse
 from typing import Callable, List
 
-import lightning as L
 import torch
 from litgpt.prompts import PromptStyle, has_prompt_style, load_prompt_style
 from litgpt.tokenizer import Tokenizer
 from litgpt.utils import (
     auto_download_checkpoint,
     check_valid_checkpoint_dir,
-    load_checkpoint,
 )
 
+from keys_values.finetune.utils import load_checkpoint
+from keys_values.rl.runtime import SingleDevice
 from keys_values.config import Config
 from keys_values.data.constants import LIT_MODEL_FNAME
 from keys_values.kvcache.factory import KVCacheFactory
@@ -120,7 +120,7 @@ def left_pad(sequences: List[torch.Tensor], pad_id: int) -> torch.Tensor:
     max_len = max(int(s.size(0)) for s in sequences)
     out = torch.full((len(sequences), max_len), pad_id, dtype=torch.long)
     for i, seq in enumerate(sequences):
-        out[i, max_len - seq.size(0):] = seq
+        out[i, max_len - seq.size(0) :] = seq
     return out
 
 
@@ -150,7 +150,7 @@ def make_reward_len(
 
 def build_model(
     checkpoint_dir,
-    fabric: L.Fabric,
+    fabric: SingleDevice,
     batch_size: int,
     cache_length: int,
     kv_cache_name: str,
@@ -162,7 +162,7 @@ def build_model(
 
     with fabric.init_module(empty_init=True):
         gpt_model = GPT(config)
-    load_checkpoint(fabric, gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
+    load_checkpoint(gpt_model, checkpoint_dir / LIT_MODEL_FNAME)
 
     # Non-dense caches are required by the gradient pass.
     gpt_model.assign_kv_caches(
@@ -205,11 +205,7 @@ def main() -> None:
     args = parser.parse_args()
 
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
-    fabric = L.Fabric(
-        devices=1,
-        accelerator=args.device,
-        precision="32-true" if args.device == "cpu" else "bf16-true",
-    )
+    fabric = SingleDevice.create(args.device)
 
     # 1. Download + convert the HF checkpoint to litgpt format.
     checkpoint_dir = auto_download_checkpoint(
@@ -270,9 +266,9 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             chunk_size=args.chunk_size,
             temperature=1.0,
-            eos_token_id=int(tokenizer.eos_id)
-            if tokenizer.eos_id is not None
-            else None,
+            eos_token_id=(
+                int(tokenizer.eos_id) if tokenizer.eos_id is not None else None
+            ),
             pad_token_id=pad_id,
             rescore_old_logps=args.rescore_old_logps,
             profile=args.profile,

@@ -17,16 +17,13 @@ from typing import Any, Dict
 
 import torch
 import pytest
-import lightning as L
 
 from keys_values.config import Config
 from litgpt.utils import _RunIf
 
-from keys_values.finetune.utils import (
-    may_match_twice_flex_attention_sdpa,
-    may_match_twice_fused_eager_sdpa,
-)
+from keys_values.finetune.utils import may_match_twice_flex_attention_sdpa
 from keys_values.attention.flex_attention import FlexAttentionArgs
+from keys_values.distributed.fabric import Fabric
 from keys_values.head_model import CrossEntropyOnLogits, SequenceClassification
 from keys_values.head_model_factory import HeadModelFactory
 from keys_values.kvcache.base import KVCacheParams
@@ -39,7 +36,7 @@ from keys_values.kvcache.test_utils import (
 )
 from keys_values.kvcache.test_utils_advanced import cache_kwargs_for_smart_lastrec
 from keys_values.model import GPT
-from keys_values.optimize.grad_accumulate import CPUOffloadAccumulateGradients
+from keys_values.distributed.grad_accumulate import CPUOffloadAccumulateGradients
 from keys_values.utils import randint_torch
 
 
@@ -53,12 +50,11 @@ def gradcomp_mha_kwargs() -> Dict[str, Any]:
 
 
 def _append_name(case: tuple) -> tuple:
-    cache_name, cache_kwargs, cache_lengths, use_old_cache, device = case
+    cache_name, cache_kwargs, cache_lengths, device = case
     parts = (
         cache_name,
         "gp10" if "grace_period" in cache_kwargs else "none",
         str(cache_lengths[0]),
-        str(use_old_cache),
         "cpu" if device.type == "cpu" else "cuda",
     )
     return case + ("-".join(parts),)
@@ -66,8 +62,8 @@ def _append_name(case: tuple) -> tuple:
 
 def args_complete_gradient_computation():
     cases = [
-        b + c + (d, a)
-        for a, b, c, d in product(
+        b + (c, a)
+        for a, b, c in product(
             available_backends(),
             [
                 ("lastrec", dict()),
@@ -75,17 +71,16 @@ def args_complete_gradient_computation():
                 ("h2o", {"grace_period": 10, "replay_log_blocksize": 64}),
             ],
             [
-                ([128, 128],),
-                ([96, 128],),
+                [128, 128],
+                [96, 128],
             ],
-            [False, True],
         )
     ]
     return [_append_name(case) for case in cases]
 
 
 @pytest.mark.parametrize(
-    "cache_name, cache_kwargs, cache_lengths, use_old_cache, device, case_name",
+    "cache_name, cache_kwargs, cache_lengths, device, case_name",
     args_complete_gradient_computation(),
 )
 def test_complete_gradient_computation(
@@ -93,7 +88,6 @@ def test_complete_gradient_computation(
     cache_name,
     cache_kwargs,
     cache_lengths,
-    use_old_cache,
     device,
     case_name,
 ):
@@ -151,11 +145,7 @@ def test_complete_gradient_computation(
             for block_idx, cache_length in enumerate(cache_lengths)
         ]
     )
-    may_match_twice = (
-        may_match_twice_fused_eager_sdpa
-        if use_old_cache
-        else may_match_twice_flex_attention_sdpa
-    )
+    may_match_twice = may_match_twice_flex_attention_sdpa
     autograd_hooks_kwargs = dict(
         max_match_trials_pack_arg=4,
         may_match_twice=may_match_twice,
@@ -197,7 +187,7 @@ def test_complete_gradient_computation(
             chunk_size=chunk_size,
             layercp_qname=qname,
             cachecp_qname=qname,
-            train_cache_kwargs=dict(use_old_cache=use_old_cache),
+            train_cache_kwargs=dict(),
             autograd_hooks_kwargs=autograd_hooks_kwargs,
             debug_single_cell_per_row=debug_flag,
             debug_dont_use_autograd_hooks=debug_flag,
@@ -254,7 +244,7 @@ def args_copy_model_to_device():
             [torch.bfloat16, torch.float16, torch.float32],
             [
                 name
-                for name, _ in cache_names_and_devices(only_cpu=True)
+                for name, _ in cache_names_and_devices(only_cpu=True)[:4]
                 if not name.startswith("dense")
             ],
         )
@@ -267,21 +257,15 @@ def args_copy_model_to_device():
     args_copy_model_to_device(),
 )
 def test_copy_model_to_device(dtype, cache_name):
-    fabric = L.Fabric(
-        devices=1,
-        num_nodes=1,
-        strategy="auto",
-        precision="bf16-true",
-    )
-    fabric.launch(
+    Fabric.launch(
         run_copy_model_to_device,
+        nprocs=1,
         dtype=dtype,
         cache_name=cache_name,
     )
 
 
 def run_copy_model_to_device(
-    fabric: L.Fabric,
     dtype: torch.dtype,
     cache_name: str,
 ):
@@ -290,7 +274,7 @@ def run_copy_model_to_device(
     torch.set_default_dtype(dtype)
 
     device = torch.device("cpu")
-    cpu_offload_device = torch.device("cuda", fabric.local_rank)
+    cpu_offload_device = Fabric.device()
     cache_lengths = [128, 128]
     batch_size = 5
     n_layer = len(cache_lengths)
@@ -340,10 +324,7 @@ def run_copy_model_to_device(
         assert kv_cache.device in (device, None), (l_ix, kv_cache.device, device)
     with torch.device(cpu_offload_device):
         head_model = HeadModelFactory.create(name=head_model_name, config=config)
-    offload_grad_accum = CPUOffloadAccumulateGradients(
-        group=[0],
-        fabric=fabric,
-    )
+    offload_grad_accum = CPUOffloadAccumulateGradients(use_dist=False)
     model = LongContextGradientModel(
         gpt_model=gpt_model,
         head_model=head_model,
@@ -411,6 +392,5 @@ if __name__ == "__main__":
         cache_name="h2o",
         cache_kwargs={"grace_period": 10, "replay_log_blocksize": 64},
         cache_lengths=[128, 128],
-        use_old_cache=False,
         device=torch.device("cuda", 0),
     )

@@ -13,15 +13,13 @@
 # limitations under the License.
 import csv
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from pprint import pprint
 from typing import Dict, Optional, Union, Any, List, Tuple
 import yaml
 
-import lightning as L
 import torch
-from lightning.fabric.strategies import DDPStrategy
 
 from litgpt.data import DataModule
 from litgpt.tokenizer import Tokenizer
@@ -30,23 +28,13 @@ from litgpt.utils import (
     check_valid_checkpoint_dir,
     get_default_supported_precision,
     parse_devices,
-    load_checkpoint,
 )
 
 from keys_values.attention.attention_utils import DEFAULT_TMP_ARRAY_LIMIT_GB
 from keys_values.config import Config as ConfigFull
+from keys_values.constants import DEFAULT_IGNORE_INDEX, DEFAULT_PAD_ID
 from keys_values.data import LongBenchV2, Helmet, INPUT_IDS_NAME
-from keys_values.evaluation.evaluator import (
-    SampleBasedMetricsEvaluator,
-    TargetType,
-)
-from keys_values.evaluation.tasks import (
-    EvaluationTasks,
-    EvaluationWithTasksHelper,
-)
-from keys_values.data.evaluation import (
-    EvaluationDataLoader,
-)
+from keys_values.data.evaluation import EvaluationDataLoader
 from keys_values.data.constants import (
     ORIG_IDX_NAME,
     TASK_NAME,
@@ -56,12 +44,22 @@ from keys_values.data.constants import (
     LORA_WEIGHTS_FNAME,
     LORA_WEIGHTS_FNAME_OLD,
 )
+from keys_values.distributed.fabric import Fabric
+from keys_values.evaluation.evaluator import (
+    SampleBasedMetricsEvaluator,
+    TargetType,
+)
+from keys_values.evaluation.tasks import (
+    EvaluationTasks,
+    EvaluationWithTasksHelper,
+)
 from keys_values.finetune.args import KVCacheArgs, SDPAArgs, EvalArgs
 from keys_values.finetune.batch_transform import BatchTransformFactory
 from keys_values.finetune.longcontext_full import (
     wrap_gpt_model,
     get_mha_and_cache_kwargs,
     create_gpt_model,
+    default_head_model,
 )
 from keys_values.finetune.utils import (
     check_kv_cache,
@@ -69,6 +67,8 @@ from keys_values.finetune.utils import (
     print_with_rank_and_timestamp,
     adjust_cache_kwargs,
     load_generation_config,
+    load_checkpoint,
+    init_module,
 )
 from keys_values.fused import (
     set_fused_swiglu_enabled,
@@ -83,6 +83,7 @@ from keys_values.utils import (
     VerbosityLevels,
     fabric_precision_to_dtype,
     remove_keys,
+    seed_everything,
 )
 
 GENERATED_SAMPLES_FILENAME = "generated_samples_{}.yaml"
@@ -101,7 +102,7 @@ class ConfigLoRA_OLD(ConfigLoRA):
 @dataclass(frozen=True)
 class ModelConfiguration:
     config: Union[ConfigFull, ConfigLoRA]
-    head_model_name: str
+    head_model_name: Optional[str]
     head_model_kwargs: Dict[str, Any]
 
 
@@ -129,12 +130,14 @@ def setup(
     attention_forward_temp_size_gb: Optional[float] = None,
     lora_dropout: Optional[float] = None,
     use_sample_metric: bool = True,
+    eval_dir: str = "eval",
     sample_metric_max_generated_tokens: int = 20,
     sample_metric_temperature: Optional[float] = None,
     sample_metric_top_k: Optional[int] = None,
     sample_metric_top_p: Optional[float] = None,
     num_store_generated_samples: Optional[int] = None,
     skip_eval: bool = False,
+    use_old_metrics: Optional[bool] = None,
 ) -> None:
     """Evaluate a range of checkpoints for several models on a test set
 
@@ -167,6 +170,9 @@ def setup(
         use_sample_metric: If `True` and the dataset has an associated
             sample-based metric, this is used. Otherwise, we use the same loss
             as used for training
+        eval_dir: Subdirectory to write evaluation and generated samples files
+            to. Defaults to "eval". Set this if you like to run evals under
+            different conditions for the same checkpoints.
         sample_metric_max_generated_tokens: Maximum number of tokens sampled
             for sample-based metric evaluation
         sample_metric_temperature: Parameter for token generation. Overrides
@@ -184,14 +190,16 @@ def setup(
             `use_sample_metric == True`.
         skip_eval: If `True`, we skip evaluations and only write files related
             to `num_store_generated_samples`.
+        use_old_metrics: If given, this overrides `data.use_old_metrics`. If
+            `True` for Helmet datasets, we use the old setup with
+            "sub_exact_match" for the QA datasets (deprecated).
 
     """
     devices = parse_devices(devices)
-    if torch.cuda.is_available():
-        if not (1 <= devices <= torch.cuda.device_count()):
-            raise ValueError(
-                f"devices = {devices}, must be in [1, {torch.cuda.device_count()}]"
-            )
+    if Fabric.cuda_is_available():
+        device_count = Fabric.device_count()
+        if not (1 <= devices <= device_count):
+            raise ValueError(f"devices = {devices}, must be in [1, {device_count}]")
     elif devices != 1:
         raise ValueError("CUDA is not available, can only do devices = 1")
     sample_metric_kwargs = dict()
@@ -219,10 +227,12 @@ def setup(
         attention_forward_temp_size_gb,
         lora_dropout,
         use_sample_metric,
+        eval_dir,
         sample_metric_max_generated_tokens,
         sample_metric_kwargs,
         num_store_generated_samples,
         skip_eval,
+        use_old_metrics,
     )
 
 
@@ -236,10 +246,12 @@ def setup_internal(
     attention_forward_temp_size_gb: Optional[float],
     lora_dropout: Optional[float],
     use_sample_metric: bool,
+    eval_dir: str,
     sample_metric_max_generated_tokens: int,
     sample_metric_kwargs: Dict[str, Any],
     num_store_generated_samples: Optional[int],
     skip_eval: bool,
+    use_old_metrics: Optional[bool],
 ) -> None:
     if num_store_generated_samples is None and skip_eval:
         raise ValueError(
@@ -260,11 +272,17 @@ def setup_internal(
     checkpoint_dir = setups[0].get("checkpoint_dir")
     if checkpoint_dir is None:
         tasks = setups[0].get("eval_tasks")
-        eval = EvaluationTasks(out_dir, model_type, tasks)
+        eval = EvaluationTasks(
+            out_dir=out_dir,
+            model_type=model_type,
+            tasks=tasks,
+            eval_dir=eval_dir,
+        )
         if not eval.tasks:
             raise ValueError(
-                f"No completed model checkpoints detected at {out_dir}. Are you "
-                f"sure that model_type = {model_type} is correct?"
+                f"No completed model checkpoints detected at {out_dir}. "
+                f"Are you sure that model_type = {model_type} and eval_dir = "
+                f"{eval_dir} are correct?"
             )
         task_path = out_dir / eval.tasks[0]
     else:
@@ -274,52 +292,55 @@ def setup_internal(
         model_type=model_type,
     )
     precision = hyp_pars["precision"] or get_default_supported_precision(training=True)
-    if devices > 1:
-        strategy = DDPStrategy(static_graph=True, broadcast_buffers=False)
-    else:
-        strategy = "auto"
-    fabric = L.Fabric(
-        devices=devices,
-        num_nodes=1,
-        strategy=strategy,
-        precision=precision,
-    )
 
-    fabric.launch(
-        main,
+    kwargs = dict(
         seed=seed,
         setups=setups,
         batch_size=batch_size,
         devices=devices,
+        precision=precision,
         verbose=verbose,
         attention_forward_temp_size_gb=attention_forward_temp_size_gb,
         use_sample_metric=use_sample_metric,
+        eval_dir=eval_dir,
         sample_metric_max_generated_tokens=sample_metric_max_generated_tokens,
         sample_metric_kwargs=sample_metric_kwargs,
         lora_dropout=lora_dropout,
         access_token=access_token,
         num_store_generated_samples=num_store_generated_samples,
         skip_eval=skip_eval,
+        use_old_metrics=use_old_metrics,
     )
+
+    if Fabric.cuda_is_available():
+        Fabric.launch(
+            main,
+            nprocs=devices,
+            **kwargs,
+        )
+    else:
+        main(**kwargs)
 
 
 def main(
-    fabric: L.Fabric,
     seed: int,
     setups: List[Dict[str, Any]],
     batch_size: int,
     devices: int,
+    precision: str,
     verbose: Optional[str],
     attention_forward_temp_size_gb: Optional[float],
     use_sample_metric: bool,
+    eval_dir: str,
     sample_metric_max_generated_tokens,
     sample_metric_kwargs: Dict[str, Any],
     lora_dropout: Optional[float],
     access_token: Optional[str],
     num_store_generated_samples: Optional[int],
     skip_eval: bool,
+    use_old_metrics: Optional[bool],
 ) -> None:
-    fabric.seed_everything(seed)
+    seed_everything(seed)
 
     # Loop over setups
     _batch_size = batch_size
@@ -336,11 +357,17 @@ def main(
         print(f"\n{prefix}out_dir = {out_dir}, model_type = {model_type}")
         if checkpoint_dir is None:
             tasks = _setup.get("eval_tasks")
-            eval_tasks = EvaluationTasks(out_dir, model_type, tasks)
+            eval_tasks = EvaluationTasks(
+                out_dir=out_dir,
+                model_type=model_type,
+                tasks=tasks,
+                eval_dir=eval_dir,
+            )
             if not eval_tasks.tasks:
                 raise ValueError(
-                    f"{prefix}No completed model checkpoints detected at {out_dir}. Are you "
-                    f"sure that model_type = {model_type} is correct?"
+                    f"{prefix}No completed model checkpoints detected at {out_dir}. "
+                    f"Are you sure that model_type = {model_type} and eval_dir = "
+                    f"{eval_dir} are correct?"
                 )
             print(
                 "Detected model checkpoints to evaluate from:\n" + str(eval_tasks.tasks)
@@ -469,6 +496,13 @@ def main(
                 raise ValueError(f"Data class path {_data_class_path} is not supported")
             data_class_path = _data_class_path
             data_init_args = _data_init_args
+        # At this point, `data` is determined, so the default head model name
+        # can be set
+        if model_config.head_model_name is None:
+            model_config = replace(
+                model_config,
+                head_model_name=default_head_model(data),
+            )
 
         # Enable/disable fused operators
         set_fused_rope_enabled(sdpa.fused_rope)
@@ -477,18 +511,25 @@ def main(
 
         # Create model
         if torch.cuda.is_available():
-            device = torch.device("cuda", fabric.local_rank)
+            device = Fabric.device()
         else:
             device = torch.device("cpu")
         try:
+            print(f"Loading tokenizer from checkpoint: {checkpoint_dir}")
             tokenizer = Tokenizer(checkpoint_dir)
         except Exception as ex:
             if eval_tasks is None:
                 # Load tokenizer from base model checkpoint
+                print(
+                    f"Loading tokenizer from base model checkpoint: {base_checkpoint_dir}"
+                )
                 tokenizer = Tokenizer(base_checkpoint_dir)
             else:
                 raise ex
-        with fabric.init_module(empty_init=(fabric.world_size > 1)):
+        with init_module(
+            empty_init=(Fabric.world_size() > 1),
+            precision=precision,
+        ):
             # Updates `kv_cache.cache_kwargs` from other args:
             kv_cache = kv_cache.update_cache_kwargs()
             # Set `mha_kwargs`, update kv_cache.cache_kwargs` with that as well:
@@ -498,13 +539,12 @@ def main(
                 kv_cache,
                 sdpa,
                 yarn_rope,
-                fabric,
                 devices,
             )
             # Depending on the cache type `kv_cache.name`, the arguments
             # `kv_cache.cache_kwargs` are adjusted
             adjust_cache_kwargs(kv_cache, data, tokenizer)
-            dtype = fabric_precision_to_dtype(fabric._precision.precision)
+            dtype = fabric_precision_to_dtype(precision)
             torch.set_default_dtype(dtype)
             with torch.device(device):
                 gpt_model = create_gpt_model(model_config.config, **mha_kwargs)
@@ -530,16 +570,15 @@ def main(
                 max_batch_size=batch_size,
                 dtype=dtype,
                 average_loss_per_batch=False,
-                fabric=fabric,
             )
         # Load base model
         file_path = base_checkpoint_dir / LIT_MODEL_FNAME
-        load_checkpoint(fabric, model.gpt_model, file_path, strict=False)
+        load_checkpoint(model.gpt_model, file_path, strict=False)
         # If there are head model weights, load them as well. Otherwise, we use
         # random initialization (or the head model may not have weights)
         file_path = base_checkpoint_dir / HEAD_MODEL_FNAME
         if file_path.exists():
-            load_checkpoint(fabric, model.head_model, file_path, strict=True)
+            load_checkpoint(model.head_model, file_path, strict=True)
 
         # Evaluation over tasks and batches
         # `num_store_generated_batches` is the number of batches for which
@@ -552,12 +591,11 @@ def main(
             if devices > 1:
                 num_store_generated_batches = (
                     num_store_generated_batches // devices
-                    + int(fabric.local_rank < num_store_generated_batches % devices)
+                    + int(Fabric.rank() < num_store_generated_batches % devices)
                 )
         else:
             num_store_generated_batches = None
         eval_for_setup(
-            fabric,
             model,
             data,
             tokenizer,
@@ -568,17 +606,18 @@ def main(
             batch_size,
             eval_tasks.tasks if eval_tasks is not None else None,
             use_sample_metric,
+            eval_dir,
             sample_metric_max_generated_tokens,
             sample_metric_kwargs,
             num_store_generated_batches,
             skip_eval,
             model_name,
             checkpoint_dir if eval_tasks is None else None,
+            use_old_metrics,
         )
 
 
 def eval_for_setup(
-    fabric: L.Fabric,
     model: LongContextInferenceModel,
     data: DataModule,
     tokenizer: Tokenizer,
@@ -589,12 +628,14 @@ def eval_for_setup(
     batch_size: int,
     eval_tasks: Optional[List[str]],
     use_sample_metric: bool,
+    eval_dir: str,
     sample_metric_max_generated_tokens,
     sample_metric_kwargs: Dict[str, Any],
     num_store_generated_batches: Optional[int],
     skip_eval: bool,
     model_name: str,
     checkpoint_dir: Optional[Path],
+    use_old_metrics: Optional[bool],
 ) -> None:
     # Test dataloader is over cross product of test dataset batches and
     # evaluation tasks
@@ -605,16 +646,20 @@ def eval_for_setup(
         head_model=model_config.head_model_name,
         batch_size=batch_size,
         devices=devices,
-        fabric=fabric,
         model_name=model_name,
     )
-    ignore_index = getattr(data, "ignore_index", -100)
+    ignore_index = getattr(data, "ignore_index", DEFAULT_IGNORE_INDEX)
 
     if use_sample_metric:
         assert isinstance(data, Helmet)
+        if use_old_metrics is None:
+            use_old_metrics = getattr(data, "use_old_metrics", False)
         evaluator = SampleBasedMetricsEvaluator(
             metrics=[
-                SampleBasedMetricsEvaluator.metric_for_helmet_task(data.dataset_key)
+                SampleBasedMetricsEvaluator.metric_for_helmet_task(
+                    data.dataset_key,
+                    old_setup=use_old_metrics,
+                )
             ],
             max_generated_tokens=sample_metric_max_generated_tokens,
             tokenizer=tokenizer,
@@ -626,11 +671,11 @@ def eval_for_setup(
 
     # Loop over test set batches
     eval_for_setup_internal(
-        fabric,
         model,
         data,
         test_dataloader,
         evaluator,
+        eval_dir,
         tokenizer,
         out_dir,
         model_type,
@@ -644,11 +689,11 @@ def eval_for_setup(
 
 
 def eval_for_setup_internal(
-    fabric: L.Fabric,
     model: LongContextInferenceModel,
     data: DataModule,
     test_dataloader: EvaluationDataLoader,
     evaluator: Optional[SampleBasedMetricsEvaluator],
+    eval_dir: str,
     tokenizer: Tokenizer,
     out_dir: Path,
     model_type: str,
@@ -657,7 +702,7 @@ def eval_for_setup_internal(
     checkpoint_dir: Optional[Path],
     num_store_generated_batches: Optional[int],
     skip_eval: bool,
-    ignore_index: int = -100,
+    ignore_index: int,
 ) -> None:
     multiple_tasks = checkpoint_dir is None
     # Loop over test set batches
@@ -666,7 +711,7 @@ def eval_for_setup_internal(
     # Others skip any batch that is locked or already done.
     batch_transform = BatchTransformFactory.from_head_model(
         head_model=model_config.head_model_name,
-        pad_id=0,
+        pad_id=DEFAULT_PAD_ID,
         eos_id=tokenizer.eos_id,
         ignore_index=ignore_index,
     )
@@ -677,13 +722,14 @@ def eval_for_setup_internal(
     # Note: If `skip_eval == True`, we assume that the eval metrics files are
     # already present, and we use the generated samples files for locking
     if skip_eval:
-        fname = "eval/" + GENERATED_SAMPLES_FILENAME
+        fname = eval_dir + "/" + GENERATED_SAMPLES_FILENAME
     else:
         fname = None
     tasks_helper = EvaluationWithTasksHelper(
         out_dir,
         tag=tag,
         eval_metrics_filename=fname,
+        eval_dir=eval_dir,
         multiple_tasks=multiple_tasks,
     )
     current_task = None
@@ -691,7 +737,7 @@ def eval_for_setup_internal(
     if devices > 1:
         # Ensure that lock for first batch is not checked at exactly the same
         # time by all devices
-        time.sleep(0.05 * fabric.global_rank)
+        time.sleep(0.05 * Fabric.rank())
     batch_idx = 0  # Batch counter per task
     skip_until_next_task = False
     for batch in test_dataiter:
@@ -722,7 +768,7 @@ def eval_for_setup_internal(
         try:
             print_with_rank_and_timestamp(
                 f"Running inference for batch {batch_name}",
-                fabric.global_rank,
+                Fabric.rank(),
             )
             if getattr(test_dataloader, "delay_tokenization", False):
                 # Tokenization only happens here
@@ -740,7 +786,6 @@ def eval_for_setup_internal(
                     model=model,
                     task_path=task_path,
                     model_type=model_type,
-                    fabric=fabric,
                 )
                 current_task = task
                 batch_idx = 0  # Reset
@@ -770,7 +815,7 @@ def eval_for_setup_internal(
             eval_time = time.perf_counter() - t0
             print_with_rank_and_timestamp(
                 f"Batch {batch_name}: {metric_name} = {metric_values.mean().item():.3f}, eval_time = {eval_time * 1000:.2f} ms",
-                fabric.global_rank,
+                Fabric.rank(),
             )
             flush_io_streams()
             if not skip_eval:
@@ -821,7 +866,6 @@ def get_dataloader(
     head_model: str,
     batch_size: int,
     devices: int,
-    fabric: Optional[L.Fabric],
     model_name: Optional[str] = None,
 ) -> EvaluationDataLoader:
     """
@@ -840,27 +884,29 @@ def get_dataloader(
         head_model: Head model name
         batch_size: Size of test batches
         devices: Number of devices to use
-        fabric: Fabric
         model_name: Sent to `data.connect`
 
     Returns:
         Data loader for cross product of test dataset with evaluation tasks
 
     """
-    num_devices = 1 if fabric is None else fabric.world_size
+    num_devices = Fabric.world_size() if Fabric.cuda_is_available() else 1
     data.connect(
         tokenizer=tokenizer,
         batch_size=batch_size,
         num_devices=num_devices,
-        rank=None if fabric is None else fabric.local_rank,
+        rank=Fabric.rank() if Fabric.cuda_is_available() else None,
         head_model=head_model,
         test_batch_size=batch_size,
         eval_tasks=eval_tasks,
         model_name=model_name,
     )
-    if fabric is not None:
-        with fabric.rank_zero_first():
-            data.prepare_data()
+
+    # Everybody needs to wait until `data.prepare_data()` finished on rank 0
+    if Fabric.rank() == 0:
+        data.prepare_data()
+    Fabric.barrier()
+
     data.setup()
     test_dataloader = data.test_dataloader(num_devices=devices)
     return test_dataloader
@@ -906,7 +952,9 @@ def load_configuration(
                 **kwargs,
             )
     # Head model
-    head_model_name = hyp_pars["head_model"]
+    # Note: `head_model_name` can be `None`, in which case the default head
+    # model is used. This can be set only once the dataset type is known.
+    head_model_name = hyp_pars.get("head_model")
     head_model_kwargs = hyp_pars.get("head_model_kwargs", dict())
     return (
         ModelConfiguration(
@@ -922,7 +970,6 @@ def load_model_checkpoint(
     model: LongContextInferenceModel,
     task_path: Path,
     model_type: str,
-    fabric: L.Fabric,
 ):
     if model_type == "full":
         file_path = task_path / LIT_MODEL_FNAME
@@ -934,12 +981,12 @@ def load_model_checkpoint(
         if not file_path.exists():
             file_path = task_path / LORA_WEIGHTS_FNAME_OLD
         strict = False
-    load_checkpoint(fabric, model.gpt_model, file_path, strict=strict)
+    load_checkpoint(model.gpt_model, file_path, strict=strict)
     # If there are head model weights, load them as well. Otherwise, we use
     # random initialization (or the head model may not have weights)
     file_path = task_path / HEAD_MODEL_FNAME
     if file_path.exists():
-        load_checkpoint(fabric, model.head_model, file_path, strict=True)
+        load_checkpoint(model.head_model, file_path, strict=True)
 
 
 def store_eval_metrics(
