@@ -108,7 +108,12 @@ EVAL_SETS = {
 
 
 def load_problems(
-    key: str, table: dict, limit: int = 0, seed: int = 42, difficulty_max: int = 0
+    key: str,
+    table: dict,
+    limit: int = 0,
+    seed: int = 42,
+    difficulty_max: int = 0,
+    difficulty_min: int = 0,
 ) -> list[dict]:
     repo, cfg, split, q_col, a_col = table[key]
     ds = (
@@ -127,16 +132,15 @@ def load_problems(
         # Polaris: "k/8" = reference-model solve rate; keep the hard end.
         def hard(r):
             d = r.get("difficulty")
-            return (
-                d is not None
-                and "/" in str(d)
-                and int(str(d).split("/")[0]) <= difficulty_max
-            )
+            if d is None or "/" not in str(d):
+                return False
+            return difficulty_min <= int(str(d).split("/")[0]) <= difficulty_max
 
         n0 = len(recs)
         recs = [r for r in recs if hard(r)]
         print(
-            f"{key}: difficulty <= {difficulty_max}/8 keeps {len(recs)}/{n0}",
+            f"{key}: difficulty in [{difficulty_min}, {difficulty_max}]/8 "
+            f"keeps {len(recs)}/{n0}",
             flush=True,
         )
     if limit and limit < len(recs):
@@ -246,6 +250,13 @@ def main() -> None:
         type=int,
         default=0,
         help="Polaris only: keep problems with difficulty <= N/8 " "(0 = no filter).",
+    )
+    p.add_argument(
+        "--difficulty-min",
+        type=int,
+        default=0,
+        help="Polaris only: and >= N/8. Use 1 to drop the 0/8 problems the "
+        "reference model never solved: all-zero groups, no gradient.",
     )
     p.add_argument(
         "--eval-sets",
@@ -409,6 +420,7 @@ def main() -> None:
             TRAIN_SETS,
             args.train_limit,
             difficulty_max=args.difficulty_max,
+            difficulty_min=args.difficulty_min,
         )
         random.Random(args.seed).shuffle(train_records)
         print(f"train {args.train_dataset}: {len(train_records)} problems", flush=True)
