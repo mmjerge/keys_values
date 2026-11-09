@@ -489,9 +489,7 @@ def test_evict_every_one_is_default(name, grace_period):
     results = []
     for kwargs in (dict(), dict(evict_every=1)):
         torch.random.manual_seed(31415927)
-        kv_cache = create_kv_cache(
-            name, params, grace_period=grace_period, **kwargs
-        )
+        kv_cache = create_kv_cache(name, params, grace_period=grace_period, **kwargs)
         results.append(_run_decode(kv_cache, params, num_prefill, num_insert))
     idx0, idx1 = results[0][3], results[1][3]
     assert len(idx0) == len(idx1) == num_insert - num_prefill

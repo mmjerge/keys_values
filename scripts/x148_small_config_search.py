@@ -114,7 +114,11 @@ def run_config(
     except ValueError as ex:
         msg = str(ex)
         if "final chunk_idx" in msg:
-            return "ADJACENCY: " + msg.split(":")[0] + msg[msg.find("final chunk_idx") - 2 :]
+            return (
+                "ADJACENCY: "
+                + msg.split(":")[0]
+                + msg[msg.find("final chunk_idx") - 2 :]
+            )
         return "OTHER: " + msg[:120]
     except Exception as ex:  # noqa: BLE001
         return "OTHER: " + type(ex).__name__ + ": " + str(ex)[:100]
@@ -160,21 +164,46 @@ def main() -> None:
     n_adj = 0
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["dtype", "n_head", "n_query_groups", "cache_length", "chunk_size",
-                    "completion_chunks", "quant", "grace", "ragged", "seconds", "result"])
+        w.writerow(
+            [
+                "dtype",
+                "n_head",
+                "n_query_groups",
+                "cache_length",
+                "chunk_size",
+                "completion_chunks",
+                "quant",
+                "grace",
+                "ragged",
+                "seconds",
+                "result",
+            ]
+        )
         for i, combo in enumerate(combos):
             cfg = dict(zip(keys, combo))
             n_head, n_qg = cfg.pop("heads")
             t0 = time.perf_counter()
             try:
-                res = run_config(device=device, n_head=n_head, n_query_groups=n_qg, **cfg)
+                res = run_config(
+                    device=device, n_head=n_head, n_query_groups=n_qg, **cfg
+                )
             except Exception:  # noqa: BLE001 - never let one config kill the sweep
                 res = "OTHER: " + traceback.format_exc().splitlines()[-1][:120]
             dt = time.perf_counter() - t0
             n_adj += res.startswith("ADJACENCY")
-            row = [str(cfg["dtype"]).replace("torch.", ""), n_head, n_qg, cfg["cache_length"],
-                   cfg["chunk_size"], cfg["completion_chunks"], cfg["quant"], cfg["grace"],
-                   cfg["ragged"], f"{dt:.1f}", res]
+            row = [
+                str(cfg["dtype"]).replace("torch.", ""),
+                n_head,
+                n_qg,
+                cfg["cache_length"],
+                cfg["chunk_size"],
+                cfg["completion_chunks"],
+                cfg["quant"],
+                cfg["grace"],
+                cfg["ragged"],
+                f"{dt:.1f}",
+                res,
+            ]
             w.writerow(row)
             f.flush()
             print(f"[{i + 1}/{len(combos)}] {row[:-2]} -> {res}", flush=True)
