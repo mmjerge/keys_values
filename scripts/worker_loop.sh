@@ -24,9 +24,19 @@
 set -uo pipefail
 
 # --- protection 1: single loop per instance ---------------------------------
+# Multi-GPU boxes: run one loop per GPU with KV_GPU=<index>. Each loop pins
+# CUDA_VISIBLE_DEVICES to its GPU, takes its own lock, and claims jobs under
+# its own id (<instance>-gpu<N>), so eight loops share one queue safely.
+# Unset KV_GPU = single-GPU box, behaviour unchanged.
+if [ -n "${KV_GPU:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="$KV_GPU"
+    LOCK="$HOME/.kv_worker_gpu${KV_GPU}.lock"
+else
+    LOCK="$HOME/.kv_worker.lock"
+fi
 if [ "${KV_WORKER_LOCKED:-0}" != "1" ]; then
     export KV_WORKER_LOCKED=1
-    exec flock -n "$HOME/.kv_worker.lock" "$0" "$@" || {
+    exec flock -n "$LOCK" "$0" "$@" || {
         echo "another worker loop already holds the lock on this instance"
         exit 0
     }
@@ -38,6 +48,10 @@ IID=$(TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
         -H "X-aws-ec2-metadata-token-ttl-seconds: 60") && \
       curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
         http://169.254.169.254/latest/meta-data/instance-id)
+# Claim id: per GPU slot on multi-GPU boxes so markers never collide.
+[ -n "${KV_GPU:-}" ] && IID="${IID}-gpu${KV_GPU}"
+# nvidia-smi ignores CUDA_VISIBLE_DEVICES; scope every query to our GPU.
+SMI_ID=${KV_GPU:+--id=$KV_GPU}
 cd "$HOME/keys_values"
 source "$HOME/venv/bin/activate"
 
@@ -74,7 +88,7 @@ while true; do
         --region $REGION --only-show-errors
 
     # --- protection 2: never start on a busy GPU ---------------------------
-    GPU_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    GPU_USED=$(nvidia-smi $SMI_ID --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
     if [ -n "${GPU_USED:-}" ] && [ "$GPU_USED" -gt 2000 ]; then
         echo "GPU busy (${GPU_USED} MiB used): returning $NAME to pending and exiting"
         aws s3 cp "$BUCKET/queue/claimed/${NAME}.${IID}.sh" \
@@ -92,11 +106,13 @@ while true; do
     # The FlashInfer .so is gitignored and survives the clean above, so a
     # job that pulls a changed kernel source would otherwise run the OLD
     # binary. Rebuild when any csrc file is newer than the .so (or no .so).
-    (cd "$HOME/keys_values" && {
+    # Serialize across GPU loops on one box: eight concurrent rebuilds of the
+    # same .so would corrupt it. Re-check staleness after taking the lock.
+    (cd "$HOME/keys_values" && exec 9>"$HOME/.kv_build.lock" && flock 9 && {
         SO=$(ls keys_values/_flashinfer_ops*.so 2>/dev/null | head -1)
         if [ -z "$SO" ] || [ -n "$(find keys_values/csrc -newer "$SO" -type f | head -1)" ]; then
             echo "FlashInfer kernels missing or stale: rebuilding"
-            CC_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+            CC_ARCH=$(nvidia-smi $SMI_ID --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
             ( unset LD_LIBRARY_PATH; export PATH=/usr/local/cuda/bin:$PATH
               pip install -q flashinfer-python
               sed -i "s/-gencode=arch=compute_90,code=sm_90/-gencode=arch=compute_${CC_ARCH},code=sm_${CC_ARCH}/" build_ext.py
@@ -115,7 +131,7 @@ while true; do
     # of $OUT. 10s cadence keeps a multi-day job under ~3 MB. The summary
     # line in job.log makes utilization regressions (issue #152 class)
     # visible at a glance instead of requiring live nvidia-smi eyeballing.
-    nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used \
+    nvidia-smi $SMI_ID --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used \
         --format=csv,noheader -l 10 > "$OUT/gpu_util.csv" 2>/dev/null &
     SMI_PID=$!
     bash "/tmp/${JOB}" > "$OUT/job.log" 2>&1
