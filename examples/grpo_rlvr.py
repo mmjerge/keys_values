@@ -591,6 +591,7 @@ def main() -> None:
         step_len: list[int] = []
         step_spread: list[float] = []
         step_overlong: list[float] = []
+        step_raw: list[float] = []
         for micro in range(args.prompts_per_update):
             rec = train_records[
                 ((step - 1) * args.prompts_per_update + micro) % len(train_records)
@@ -605,6 +606,7 @@ def main() -> None:
                     row = row[row != pad_id]
                     step_len.append(int(row.numel()))
                     r = answer_reward(tokenizer.decode(row), rec["answer"])
+                    step_raw.append(float(r))
                     vals.append(overlong_reward(r, overlong, args.overlong_penalty))
                 step_spread.append(1.0 if max(vals) - min(vals) > 1e-9 else 0.0)
                 return torch.tensor(vals, dtype=torch.float32)
@@ -640,10 +642,14 @@ def main() -> None:
             "mean_len": sum(step_len) / max(len(step_len), 1),
             "spread": sum(step_spread) / max(len(step_spread), 1),
             "overlong_frac": sum(step_overlong) / max(len(step_overlong), 1),
+            # Correctness-only reward (no overlong penalty): comparable
+            # across runs with and without --overlong-penalty.
+            "reward_raw": sum(step_raw) / max(len(step_raw), 1),
         }
         msg = (
             f" | len {entry['mean_len']:.0f} spread {entry['spread']:.2f}"
             f" overlong_frac {entry['overlong_frac']:.2f}"
+            f" raw {entry['reward_raw']:.3f}"
         )
         for key in ("grad_peak_device_mib", "parked_peak_mib", "parked_peak_count"):
             if key in micro_metrics[0]:
