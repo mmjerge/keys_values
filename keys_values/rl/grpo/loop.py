@@ -35,7 +35,7 @@ is the reason to use KeysAndValues for RL in the first place.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Tuple
 
 import functools
 import os
@@ -249,6 +249,97 @@ def _dense_baseline_backward(
     return loss
 
 
+def _chunked_micro_batched_backward(
+    grad_model: LongContextGradientModel,
+    head: GRPOLossHeadModel,
+    model_input_ids: torch.Tensor,
+    completions: torch.Tensor,
+    grad_scale: float,
+    grad_micro_batch: int,
+) -> Tuple[torch.Tensor, int, int]:
+    """
+    Chunked (sparse-KV) backward over the group in micro-batches of
+    ``grad_micro_batch`` sequences, accumulating gradients.
+
+    Every memory term of the chunked backward carries the batch size as a
+    factor (per-chunk K-long attention tensors, per-token block activations,
+    replay/checkpoint buffers), so processing ``mb`` of the ``B`` sequences
+    at a time divides the gradient-phase peak by ``B / mb``. This is what
+    lets H2O caches with K=16384 / K=32768 fit a 44 GiB GPU for Qwen3-1.7B.
+
+    Exactness. The full-batch pass computes (``accumulate.py:run_head_model``
+    with ``average_loss_per_batch=True``)::
+
+        loss = grad_scale / (B * denom_full) * sum_b sum_t loss_bt
+
+    where ``denom_full`` is the batch mean of the per-sequence valid token
+    counts (``per_sequence_norm=False``) or ``1`` (``per_sequence_norm=True``,
+    the head divides inside ``forward`` and ``num_target_entries`` returns
+    ones). For a micro-batch ``S`` of size ``mb`` the model instead divides by
+    ``mb * denom_S`` (``denom_S`` = mean count over ``S``), so passing
+    ``scale_factor = grad_scale * mb * denom_S / (B * denom_full)`` makes
+    its loss equal to ``grad_scale / (B * denom_full) * sum_{b in S} sum_t
+    loss_bt``; the micro-batch losses (and gradients) then sum to the
+    full-batch ones. This mirrors ``per_seq_scale`` in
+    :func:`_dense_baseline_backward`.
+
+    Micro-batches are contiguous slices of the group. Advantages are computed
+    once on the full group before the backward (:func:`compute_group_advantages`)
+    and are per-sequence constants from then on, as are the completion mask
+    and the old log-probs, so slicing them needs no further care; no
+    normalization in the loss depends on which sequences share a pass once
+    ``denom_full`` is fixed above.
+
+    Returns ``(loss, parked_peak_bytes, parked_peak_count)``: the summed loss
+    (equal to the full-batch loss value) and the max over passes of
+    :attr:`LongContextGradientModel.last_parked_peak`.
+    """
+    batch_size = completions.shape[0]
+    # Per-batch head state, sliced per micro-batch below and restored after
+    advantages_all = head._advantages
+    old_logps_all = head._old_logps
+    mask_all = head._mask
+
+    def _denom(targets: torch.Tensor) -> float:
+        num_entries = head.num_target_entries(targets)
+        if num_entries is None:
+            return 1.0
+        return num_entries.to(dtype=torch.float32).mean().item()
+
+    # Must be evaluated on the full-batch mask, before the per-micro-batch
+    # `set_batch` calls below.
+    denom_full = _denom(completions)
+    loss = None
+    parked_bytes, parked_count = 0, 0
+    try:
+        for start in range(0, batch_size, grad_micro_batch):
+            end = min(start + grad_micro_batch, batch_size)
+            mb = end - start
+            head.set_batch(
+                advantages=advantages_all[start:end],
+                old_logps=None if old_logps_all is None else old_logps_all[start:end],
+                mask=None if mask_all is None else mask_all[start:end],
+            )
+            denom_mb = _denom(completions[start:end])
+            scale_factor = grad_scale * mb * denom_mb / (batch_size * denom_full)
+            loss_mb = grad_model(
+                model_input_ids[start:end],
+                completions[start:end],
+                scale_factor=scale_factor,
+            )
+            loss_mb.backward()
+            loss_mb = loss_mb.detach()
+            loss = loss_mb if loss is None else loss + loss_mb
+            pb, pc = grad_model.last_parked_peak
+            parked_bytes = max(parked_bytes, pb)
+            parked_count = max(parked_count, pc)
+    finally:
+        head.set_batch(
+            advantages=advantages_all, old_logps=old_logps_all, mask=mask_all
+        )
+    return loss, parked_bytes, parked_count
+
+
 def grpo_step(
     gpt_model: GPT,
     prompt_ids: torch.Tensor,
@@ -275,6 +366,7 @@ def grpo_step(
     backward_tmp_gb: float = 0.0,
     dense_baseline: bool = False,
     per_sequence_norm: bool = False,
+    grad_micro_batch: int | None = None,
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -324,6 +416,16 @@ def grpo_step(
         Normalize each sequence's loss by its own token count instead of the
         group-mean count, so long and short rollouts contribute equal
         gradient mass. See :class:`GRPOLossHeadModel`. Default ``False``.
+    grad_micro_batch : int | None
+        Number of sequences per chunked backward pass. ``None`` (default):
+        the whole group ``(num_prompts * group_size, T)`` goes through one
+        pass, today's behavior and memory. ``1..B``: the group is processed
+        in ``ceil(B / grad_micro_batch)`` passes with gradient accumulation
+        and a per-pass ``scale_factor`` that reproduces the full-batch
+        normalization exactly (both ``per_sequence_norm`` modes), dividing
+        the gradient-phase device peak by about ``B / grad_micro_batch``.
+        See :func:`_chunked_micro_batched_backward`. Ignored when
+        ``dense_baseline=True`` (that arm is already per sequence).
 
     Returns
     -------
@@ -332,6 +434,8 @@ def grpo_step(
         ``advantage_std``, ``completion_len``, ``total_completions`` (plus
         timing keys if ``profile=True``).
     """
+    if grad_micro_batch is not None and grad_micro_batch < 1:
+        raise ValueError(f"grad_micro_batch = {grad_micro_batch}, must be >= 1")
     device = next(gpt_model.parameters()).device
     num_prompts, prompt_len = prompt_ids.shape
     times: Dict[str, float] = {}
@@ -458,9 +562,20 @@ def grpo_step(
                 completions=completions,
                 grad_scale=grad_scale,
             )
-        else:
+        elif grad_micro_batch is None or grad_micro_batch >= total:
             loss = grad_model(model_input_ids, completions, scale_factor=grad_scale)
             loss.backward()
+            parked_bytes, parked_count = grad_model.last_parked_peak
+        else:
+            # Micro-batched: same gradient, device peak divided by ~G/mb
+            loss, parked_bytes, parked_count = _chunked_micro_batched_backward(
+                grad_model=grad_model,
+                head=head,
+                model_input_ids=model_input_ids,
+                completions=completions,
+                grad_scale=grad_scale,
+                grad_micro_batch=grad_micro_batch,
+            )
         if optimizer_step:
             optimizer.step()
 
@@ -483,7 +598,7 @@ def grpo_step(
             1 << 20
         )
     if not dense_baseline:
-        parked_bytes, parked_count = grad_model.last_parked_peak
+        # Max over the micro-batch passes (one pass if grad_micro_batch=None)
         metrics["parked_peak_mib"] = parked_bytes / (1 << 20)
         metrics["parked_peak_count"] = float(parked_count)
     if rescore_old_logps:

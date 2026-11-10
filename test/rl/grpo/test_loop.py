@@ -268,6 +268,109 @@ def test_dense_baseline_matches_chunked_gradient(per_sequence_norm):
         )
 
 
+@pytest.mark.parametrize("per_sequence_norm", [False, True])
+@pytest.mark.parametrize("grad_micro_batch", [1, 3])
+def test_grad_micro_batch_matches_full_batch_chunked_gradient(
+    grad_micro_batch, per_sequence_norm
+):
+    """
+    `grad_micro_batch` exists only to cut the gradient-phase memory peak
+    (every term of the chunked backward carries the batch size); it must not
+    change the objective. Gradients and loss over the 4-sequence batch,
+    accumulated over micro-batches of 1 (4 passes) and of 3 (a non-divisor:
+    passes of 3 and 1 sequences, so the per-pass `scale_factor` must undo
+    the model's own mean over a *different* micro-batch size and token-count
+    mean each time), must equal the single full-batch pass, under both
+    normalizations. Rollout, reward and advantages are computed before the
+    backward and must be identical.
+    """
+    num_prompts, prompt_len = 2, 8
+    group_size = 2
+    max_new_tokens = 6
+    cache_length = 32
+
+    def run(mb):
+        torch.manual_seed(7)
+        batch_size = num_prompts * group_size
+        gpt_model, config = _make_model_with_caches(batch_size, cache_length)
+        prompt_ids = torch.randint(0, config.vocab_size, (num_prompts, prompt_len))
+
+        def reward_fn(prompts, completions):
+            return completions.float().mean(dim=1)
+
+        optimizer = torch.optim.SGD(gpt_model.parameters(), lr=0.0)  # no update
+        torch.manual_seed(11)  # identical sampling in both arms
+        metrics = grpo_step(
+            gpt_model=gpt_model,
+            prompt_ids=prompt_ids,
+            reward_fn=reward_fn,
+            optimizer=optimizer,
+            group_size=group_size,
+            max_new_tokens=max_new_tokens,
+            chunk_size=16,
+            temperature=1.0,
+            eos_token_id=5,  # on this seed: early stops -> rows of 2, 4, 6, 6
+            per_sequence_norm=per_sequence_norm,
+            grad_micro_batch=mb,
+        )
+        # Rows of different length, otherwise group-mean and per-sequence
+        # normalization coincide and the scale_factor bookkeeping is untested.
+        assert metrics["mean_completion_tokens"] < max_new_tokens
+        grads = {
+            name: p.grad.detach().clone()
+            for name, p in gpt_model.named_parameters()
+            if p.grad is not None
+        }
+        return metrics, grads
+
+    m_full, g_full = run(None)
+    m_micro, g_micro = run(grad_micro_batch)
+
+    # Same rollout, reward and advantages (computed before the backward)
+    for key in (
+        "total_completions",
+        "completion_len",
+        "mean_reward",
+        "mean_advantage",
+        "advantage_std",
+        "mean_completion_tokens",
+    ):
+        assert m_full[key] == m_micro[key], key
+    # Same loss value (sum of the micro-batch losses)
+    torch.testing.assert_close(
+        torch.tensor(m_micro["loss"]),
+        torch.tensor(m_full["loss"]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    # Same gradients (fp32 CPU; only the accumulation order differs)
+    assert g_full and g_micro, "expected gradients in both arms"
+    assert set(g_full) == set(g_micro)
+    for name in g_full:
+        torch.testing.assert_close(
+            g_micro[name], g_full[name], rtol=1e-4, atol=1e-6, msg=name
+        )
+    # Memory metrics are still reported for the whole step
+    assert "parked_peak_mib" in m_micro and "parked_peak_count" in m_micro
+
+
+def test_grad_micro_batch_rejects_zero():
+    gpt_model, config = _make_model_with_caches(2, 32)
+    prompt_ids = torch.randint(0, config.vocab_size, (1, 8))
+    optimizer = torch.optim.SGD(gpt_model.parameters(), lr=0.0)
+    with pytest.raises(ValueError, match="grad_micro_batch"):
+        grpo_step(
+            gpt_model=gpt_model,
+            prompt_ids=prompt_ids,
+            reward_fn=lambda p, c: c.float().mean(dim=1),
+            optimizer=optimizer,
+            group_size=2,
+            max_new_tokens=4,
+            chunk_size=16,
+            grad_micro_batch=0,
+        )
+
+
 def test_grpo_step_trains_lora_adapters():
     """
     LoRA adapters must receive gradients through the chunked backward and

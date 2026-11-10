@@ -372,6 +372,16 @@ def main() -> None:
         "of the group-mean count, so a 25k-token rollout no longer "
         "carries 3x the gradient mass of an 8k one (length drift).",
     )
+    p.add_argument(
+        "--grad-micro-batch",
+        type=int,
+        default=None,
+        help="Sequences per chunked backward pass (default: whole group in "
+        "one pass). Every memory term of the chunked backward scales with "
+        "the batch size, so e.g. 1 or 2 divides the gradient-phase peak by "
+        "G or G/2 and lets H2O K=16384/32768 fit a 44 GiB GPU for "
+        "Qwen3-1.7B. Exact: gradients and loss equal the single-pass ones.",
+    )
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/grpo_rlvr")
@@ -631,6 +641,7 @@ def main() -> None:
                     backward_tmp_gb=args.backward_tmp_gb,
                     dense_baseline=args.dense_baseline,
                     per_sequence_norm=args.per_sequence_norm,
+                    grad_micro_batch=args.grad_micro_batch,
                 )
             )
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
