@@ -222,6 +222,29 @@ def answer_reward(completion: str, gold: str) -> float:
     return 1.0 if _symbolic_match(boxed, gold) else 0.0
 
 
+def is_overlong(
+    row: torch.Tensor, pad_id: int, max_new_tokens: int, eos_id: int | None = None
+) -> bool:
+    """True iff a completion row used the full ``max_new_tokens`` budget
+    without stopping: no padding (padding only follows an early stop) and the
+    last token is not EOS (a sequence may legitimately emit EOS exactly at
+    the cutoff; the stop token is kept in the row)."""
+    if int((row != pad_id).sum().item()) != max_new_tokens:
+        return False
+    return eos_id is None or int(row[-1].item()) != eos_id
+
+
+def overlong_reward(reward: float, overlong: bool, penalty: float) -> float:
+    """Subtract ``penalty`` from the verifier reward of a truncated rollout
+    (``penalty > 0`` only). The verifier result is kept, so a truncated
+    rollout that somehow verifies scores ``1 - penalty``, an ordinary
+    truncated one ``-penalty``: the reward separates "ran out of budget" from
+    "finished and wrong", which the binary verifier alone cannot."""
+    if overlong and penalty > 0:
+        return reward - penalty
+    return reward
+
+
 # ------------------------------------------------------------------ main ---
 
 
@@ -332,6 +355,22 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Rollout sampling temperature (RLVR standard: 1.0).",
+    )
+    p.add_argument(
+        "--overlong-penalty",
+        type=float,
+        default=0.0,
+        help="Subtract this from the reward of a rollout that used the full "
+        "--max-new-tokens budget without EOS (truncated mid-reasoning), "
+        "so 'ran out of budget' scores below 'finished and wrong'. "
+        "0 = off (default). overlong_frac is logged regardless.",
+    )
+    p.add_argument(
+        "--per-sequence-norm",
+        action="store_true",
+        help="Normalize each rollout's loss by its own token count instead "
+        "of the group-mean count, so a 25k-token rollout no longer "
+        "carries 3x the gradient mass of an 8k one (length drift).",
     )
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
@@ -551,6 +590,7 @@ def main() -> None:
         micro_metrics = []
         step_len: list[int] = []
         step_spread: list[float] = []
+        step_overlong: list[float] = []
         for micro in range(args.prompts_per_update):
             rec = train_records[
                 ((step - 1) * args.prompts_per_update + micro) % len(train_records)
@@ -560,9 +600,12 @@ def main() -> None:
             def reward_fn(p_ids, completion_ids):
                 vals = []
                 for row in completion_ids:
+                    overlong = is_overlong(row, pad_id, args.max_new_tokens, eos_id)
+                    step_overlong.append(1.0 if overlong else 0.0)
                     row = row[row != pad_id]
                     step_len.append(int(row.numel()))
-                    vals.append(answer_reward(tokenizer.decode(row), rec["answer"]))
+                    r = answer_reward(tokenizer.decode(row), rec["answer"])
+                    vals.append(overlong_reward(r, overlong, args.overlong_penalty))
                 step_spread.append(1.0 if max(vals) - min(vals) > 1e-9 else 0.0)
                 return torch.tensor(vals, dtype=torch.float32)
 
@@ -585,6 +628,7 @@ def main() -> None:
                     grad_scale=1.0 / args.prompts_per_update,
                     backward_tmp_gb=args.backward_tmp_gb,
                     dense_baseline=args.dense_baseline,
+                    per_sequence_norm=args.per_sequence_norm,
                 )
             )
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
@@ -595,8 +639,12 @@ def main() -> None:
             "sec": dt,
             "mean_len": sum(step_len) / max(len(step_len), 1),
             "spread": sum(step_spread) / max(len(step_spread), 1),
+            "overlong_frac": sum(step_overlong) / max(len(step_overlong), 1),
         }
-        msg = f" | len {entry['mean_len']:.0f} spread {entry['spread']:.2f}"
+        msg = (
+            f" | len {entry['mean_len']:.0f} spread {entry['spread']:.2f}"
+            f" overlong_frac {entry['overlong_frac']:.2f}"
+        )
         for key in ("grad_peak_device_mib", "parked_peak_mib", "parked_peak_count"):
             if key in micro_metrics[0]:
                 entry[key] = max(m[key] for m in micro_metrics)

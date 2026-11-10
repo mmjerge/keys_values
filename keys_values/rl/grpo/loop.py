@@ -204,6 +204,10 @@ def _dense_baseline_backward(
         # `average_loss_per_batch=True` semantics, identical to the chunked
         # path: every per-token loss is divided by the batch mean of valid
         # token counts, then per-sequence sums are averaged over the batch.
+        # With `head.per_sequence_norm`, the head divides inside `forward`
+        # and `num_target_entries` returns ones, so `denom == 1` here too.
+        # Must be evaluated on the full-batch mask, before the per-sequence
+        # `set_batch` calls below.
         num_entries = head.num_target_entries(completions)
         if num_entries is not None:
             denom = num_entries.to(dtype=torch.float32).mean().item()
@@ -270,6 +274,7 @@ def grpo_step(
     advantage_mode: str = "grpo",
     backward_tmp_gb: float = 0.0,
     dense_baseline: bool = False,
+    per_sequence_norm: bool = False,
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -315,6 +320,10 @@ def grpo_step(
         optimizer update, call ``grpo_step`` K times with
         ``zero_grad=(k == 0)``, ``optimizer_step=(k == K-1)`` and
         ``grad_scale=1/K``; gradients sum across the calls.
+    per_sequence_norm : bool
+        Normalize each sequence's loss by its own token count instead of the
+        group-mean count, so long and short rollouts contribute equal
+        gradient mass. See :class:`GRPOLossHeadModel`. Default ``False``.
 
     Returns
     -------
@@ -401,6 +410,7 @@ def grpo_step(
         epsilon_low=epsilon_low,
         epsilon_high=epsilon_high,
         temperature=temperature,
+        per_sequence_norm=per_sequence_norm,
     )
     head.set_batch(advantages=advantages, old_logps=old_logps, mask=mask)
     # With the new training replay cache, "ext-*" annotations match twice;

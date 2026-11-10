@@ -19,6 +19,7 @@ generation -> reward -> advantages -> old log-probs -> policy gradient ->
 optimizer step.
 """
 
+import pytest
 import torch
 
 from keys_values.config import Config
@@ -189,7 +190,8 @@ def test_grpo_step_with_backward_tmp_limit():
     assert torch.isfinite(torch.tensor(metrics["loss"]))
 
 
-def test_dense_baseline_matches_chunked_gradient():
+@pytest.mark.parametrize("per_sequence_norm", [False, True])
+def test_dense_baseline_matches_chunked_gradient(per_sequence_norm):
     """
     The dense baseline must compute the SAME loss and the SAME gradients as
     the chunked path, so that paper comparisons isolate memory/feasibility
@@ -197,6 +199,10 @@ def test_dense_baseline_matches_chunked_gradient():
 
     Same seed -> same rollout, advantages and mask; the only difference is
     the gradient computation (full-sequence backward vs chunked cells).
+
+    Run for both normalizations: `per_sequence_norm=True` moves the division
+    into the head's forward and makes `num_target_entries` a no-op, and both
+    arms must agree on that too.
     """
     num_prompts, prompt_len = 2, 8
     group_size = 2
@@ -224,7 +230,12 @@ def test_dense_baseline_matches_chunked_gradient():
             chunk_size=16,
             temperature=1.0,
             dense_baseline=dense,
+            eos_token_id=5,  # on this seed: early stops -> rows of 2, 4, 6, 6
+            per_sequence_norm=per_sequence_norm,
         )
+        # Rows of different length, otherwise the two normalizations coincide
+        # and the per_sequence_norm=True arm would test nothing new.
+        assert metrics["mean_completion_tokens"] < max_new_tokens
         grads = {
             name: p.grad.detach().clone()
             for name, p in gpt_model.named_parameters()
