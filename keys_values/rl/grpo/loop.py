@@ -50,6 +50,7 @@ from keys_values.array_limit import TemporaryArrayLimit
 from keys_values.attention.base import do_softcapping
 from keys_values.finetune.utils import may_match_twice_flex_attention_sdpa
 from keys_values.kvcache.factory import deallocate_kv_cache_buffers_of_model
+from keys_values.rl.grpo.attention import gradient_sdpa_mode_name
 from keys_values.rl.grpo.loss import GRPOLossHeadModel
 from keys_values.rl.grpo.rollout import generate_completions_with_logprobs
 from keys_values.kvcache.gradient.main import LongContextGradientModel
@@ -367,6 +368,7 @@ def grpo_step(
     dense_baseline: bool = False,
     per_sequence_norm: bool = False,
     grad_micro_batch: int | None = None,
+    train_cache_kwargs: Dict[str, Any] | None = None,
     verbose: VerbosityLevels = VerbosityLevels.NONE,
 ) -> Dict[str, float]:
     """Run one GRPO optimization step end-to-end on a KeysAndValues model.
@@ -426,17 +428,34 @@ def grpo_step(
         the gradient-phase device peak by about ``B / grad_micro_batch``.
         See :func:`_chunked_micro_batched_backward`. Ignored when
         ``dense_baseline=True`` (that arm is already per sequence).
+    train_cache_kwargs : dict | None
+        Extra keyword arguments for the training replay caches of the
+        gradient cells (``LongContextGradientModel(train_cache_kwargs=...)``).
+        ``{"flexatt_args": FlexAttentionArgs(...)}`` makes the cells run their
+        chunk SDPA with FlexAttention (C-long queries, no K-long SDPA output
+        per chunk) while the model's own MHA objects, and so rollout decode,
+        stay on FlashInfer. Use :func:`gradient_train_cache_kwargs`. Requires
+        CUDA. ``None`` (default): the cells follow the MHA's configuration,
+        i.e. query-padded PyTorch SDPA unless the MHA has ``flexatt_args``.
 
     Returns
     -------
     dict
         Metrics: ``loss``, ``mean_reward``, ``mean_advantage``,
-        ``advantage_std``, ``completion_len``, ``total_completions`` (plus
-        timing keys if ``profile=True``).
+        ``advantage_std``, ``completion_len``, ``total_completions``,
+        ``grad_sdpa_mode`` (SDPA mode of the gradient cells; not with
+        ``dense_baseline``) (plus timing keys if ``profile=True``).
     """
     if grad_micro_batch is not None and grad_micro_batch < 1:
         raise ValueError(f"grad_micro_batch = {grad_micro_batch}, must be >= 1")
     device = next(gpt_model.parameters()).device
+    train_cache_kwargs = dict(train_cache_kwargs or {})
+    if train_cache_kwargs.get("flexatt_args") is not None and device.type != "cuda":
+        # The replay cache would select FlexAttention and fail in torch.compile
+        raise ValueError(
+            "train_cache_kwargs['flexatt_args'] (FlexAttention in the gradient "
+            f"cells) requires a CUDA device, but the model is on {device}"
+        )
     num_prompts, prompt_len = prompt_ids.shape
     times: Dict[str, float] = {}
 
@@ -517,8 +536,11 @@ def grpo_step(
         per_sequence_norm=per_sequence_norm,
     )
     head.set_batch(advantages=advantages, old_logps=old_logps, mask=mask)
-    # With the new training replay cache, "ext-*" annotations match twice;
-    # without `may_match_twice`, the second save is left as an unmatched pack
+    # The reordered / GQA-expanded K/V an "ext-*" annotation describes can be
+    # saved twice in the autograd graph, under both FlexAttention and
+    # query-padded SDPA in the cells. `may_match_twice` keeps the annotation
+    # alive after its first match (a permissive superset: unmatched leftovers
+    # are harmless); without it, the second save is left as an unmatched pack
     # argument, which can stall the annotation chain in the chunked backward
     # (issue #148). This mirrors the finetune path (`may_match_twice_factory`).
     autograd_hooks_kwargs: Dict[str, Any] = dict(
@@ -543,6 +565,7 @@ def grpo_step(
         layers_per_cell=layers_per_cell,
         chunk_size=chunk_size,
         verbose=verbose,
+        train_cache_kwargs=train_cache_kwargs,
         autograd_hooks_kwargs=autograd_hooks_kwargs,
         **_grad_limit_kwargs,
     )
@@ -601,6 +624,10 @@ def grpo_step(
         # Max over the micro-batch passes (one pass if grad_micro_batch=None)
         metrics["parked_peak_mib"] = parked_bytes / (1 << 20)
         metrics["parked_peak_count"] = float(parked_count)
+        # SDPA mode of the gradient cells (flexattention / qpadded-pytorch)
+        metrics["grad_sdpa_mode"] = gradient_sdpa_mode_name(
+            gpt_model, train_cache_kwargs
+        )
     if rescore_old_logps:
         # Quantify the rollout (decode) vs. training-forward log-prob skew over
         # real completion tokens -- a measure of the train/inference gap.

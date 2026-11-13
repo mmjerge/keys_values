@@ -71,7 +71,11 @@ from keys_values.lora import (
     mark_only_lora_as_trainable,
 )
 from keys_values.model import GPT
-from keys_values.rl.grpo.attention import ATTN_BACKENDS, attention_mha_kwargs
+from keys_values.rl.grpo.attention import (
+    ATTN_BACKENDS,
+    attention_mha_kwargs,
+    gradient_train_cache_kwargs,
+)
 from keys_values.rl.grpo.loop import grpo_step
 from keys_values.rl.grpo.rollout import generate_completions
 from keys_values.utils import VerbosityLevels
@@ -328,9 +332,12 @@ def main() -> None:
         "--attn",
         default="auto",
         choices=ATTN_BACKENDS,
-        help="Attention backend: auto = FlashInfer if built, else eager "
-        "with a loud warning (Flex recompiles per kv_len in decode); "
-        "flex (gradient-pass experiments); eager (baseline).",
+        help="Attention backend. auto: FlashInfer decode if built (else eager "
+        "with a loud warning) and FlexAttention in the gradient cells on CUDA "
+        "(C-long queries, no K^2/C memory term); flex: FlexAttention "
+        "everywhere, decode recompiles per kv_len (experiments only); eager: "
+        "eager decode and query-padded PyTorch SDPA in the gradient cells "
+        "(the pre-Flex path, A/B baseline).",
     )
     p.add_argument("--backward-tmp-gb", type=float, default=2.0)
     p.add_argument("--lora-r", type=int, default=0)
@@ -477,11 +484,20 @@ def main() -> None:
     check_valid_checkpoint_dir(checkpoint_dir)
     # Attention backend. Must reach both the model and the caches (the caches
     # build their own MHA, and the gradient cells reuse kv_cache.mha).
+    attn_backend = (
+        "eager" if args.disable_flashinfer and args.attn == "auto" else args.attn
+    )
     mha_kwargs = attention_mha_kwargs(
-        backend=(
-            "eager" if args.disable_flashinfer and args.attn == "auto" else args.attn
-        ),
+        backend=attn_backend,
         kv_cache_name=args.kv_cache_name,
+        chunk_size=args.chunk_size,
+        device=fabric.device,
+    )
+    # Gradient cells only: FlexAttention under auto (CUDA), query-padded SDPA
+    # under eager. Reaches TrainingAttnWeightsReplayCache via grpo_step; the
+    # decode MHAs above are not touched.
+    train_cache_kwargs = gradient_train_cache_kwargs(
+        backend=attn_backend,
         chunk_size=args.chunk_size,
         device=fabric.device,
     )
@@ -642,6 +658,7 @@ def main() -> None:
                     dense_baseline=args.dense_baseline,
                     per_sequence_norm=args.per_sequence_norm,
                     grad_micro_batch=args.grad_micro_batch,
+                    train_cache_kwargs=train_cache_kwargs,
                 )
             )
         mean_r = sum(m["mean_reward"] for m in micro_metrics) / len(micro_metrics)
@@ -667,6 +684,10 @@ def main() -> None:
                 entry[key] = max(m[key] for m in micro_metrics)
         if "grad_peak_device_mib" in entry:
             msg += f" | dev peak {entry['grad_peak_device_mib'] / 1024:.1f}G"
+        if "grad_sdpa_mode" in micro_metrics[0]:
+            # SDPA mode of the gradient cells (flexattention / qpadded-pytorch)
+            entry["grad_sdpa_mode"] = micro_metrics[0]["grad_sdpa_mode"]
+            msg += f" | grad {entry['grad_sdpa_mode']}"
         print(f"step {step:4d} | reward {mean_r:.3f} | {dt:.1f}s{msg}", flush=True)
         history.append(entry)
         if step % args.eval_every == 0 and step < args.steps:
